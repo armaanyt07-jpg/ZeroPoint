@@ -18,13 +18,27 @@ export class FakeRedis implements RedisClient {
   ttls = new Map<string, number | undefined>();
   failing = false;
   getCalls: string[] = [];
+  /** When set, every GET takes this long, so tests can observe concurrency. */
+  getDelayMs = 0;
+  /** When true, SET never completes (a slow Redis): used to prove writes are off the critical path. */
+  hangOnSet = false;
+  private inFlight = 0;
+  maxInFlight = 0;
 
   async get(key: string) {
     this.getCalls.push(key);
-    if (this.failing) throw new RedisError('down');
-    return this.data.get(key) ?? null;
+    this.inFlight++;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    try {
+      if (this.getDelayMs) await new Promise((r) => setTimeout(r, this.getDelayMs));
+      if (this.failing) throw new RedisError('down');
+      return this.data.get(key) ?? null;
+    } finally {
+      this.inFlight--;
+    }
   }
   async set(key: string, value: string, ttl?: number) {
+    if (this.hangOnSet) return new Promise<void>(() => {});
     if (this.failing) throw new RedisError('down');
     this.data.set(key, value);
     this.ttls.set(key, ttl);
@@ -36,6 +50,8 @@ export class FakeStore implements TenantStore {
   endUsers = new Map<string, EndUserRecord>();
   credentials = new Map<string, string>();
   failing = false;
+  /** Fail only the credential table, to test error precedence. */
+  failCredentials = false;
   calls = { apiKey: 0, endUser: 0, credential: 0 };
 
   private check() {
@@ -54,6 +70,7 @@ export class FakeStore implements TenantStore {
   async findProviderCredential(tenantId: string, provider: string) {
     this.calls.credential++;
     this.check();
+    if (this.failCredentials) throw new StoreError('credentials table down');
     return this.credentials.get(`${tenantId}:${provider}`) ?? null;
   }
 }
@@ -65,6 +82,14 @@ export class FakeTelemetry implements Telemetry {
   }
   count(metric: MetricName) {
     return this.events.filter((e) => e.metric === metric).length;
+  }
+  /** Counts of the request-accounting metrics, for invariant checks. */
+  accounting() {
+    return {
+      total: this.count('requests_total'),
+      allowed: this.count('requests_allowed'),
+      rejected: this.count('requests_rejected'),
+    };
   }
 }
 
@@ -80,6 +105,10 @@ export interface Harness {
   providerFetch: ReturnType<typeof vi.fn>;
   deps: Dependencies;
   encryptionKey: string;
+  /** Background work handed to ctx.waitUntil (cache writes). */
+  deferred: Promise<unknown>[];
+  /** Waits for all background work, like the Workers runtime does after the response. */
+  flush(): Promise<void>;
 }
 
 /** A tenant with one active key, an OpenAI credential, and a $20 default budget. */
@@ -105,19 +134,23 @@ export async function createHarness(): Promise<Harness> {
       new Response('{"id":"chatcmpl-1"}', { headers: { 'content-type': 'application/json' } }),
   );
 
+  const deferred: Promise<unknown>[] = [];
   const deps: Dependencies = {
     redis,
-    directory: new Directory(redis, store, telemetry),
+    directory: new Directory(redis, store, telemetry, (work) => void deferred.push(work)),
     telemetry,
     providers: createDefaultRegistry(),
     encryptionKey,
     fetch: providerFetch as unknown as typeof fetch,
   };
-  return { redis, store, telemetry, providerFetch, deps, encryptionKey };
+  const flush = async () => {
+    await Promise.all(deferred.splice(0));
+  };
+  return { redis, store, telemetry, providerFetch, deps, encryptionKey, deferred, flush };
 }
 
 export function proxyRequest(
-  overrides: { headers?: Record<string, string | null>; body?: string; method?: string } = {},
+  overrides: { headers?: Record<string, string | null>; body?: string; method?: string; path?: string } = {},
 ): Request {
   const headers: Record<string, string> = {
     authorization: `Bearer ${PROXY_KEY}`,
@@ -130,7 +163,7 @@ export function proxyRequest(
     else headers[k] = v;
   }
   const method = overrides.method ?? 'POST';
-  return new Request('https://zeropoint.example/v1/chat/completions', {
+  return new Request(`https://zeropoint.example${overrides.path ?? '/v1/chat/completions'}`, {
     method,
     headers,
     ...(method === 'POST' ? { body: overrides.body ?? '{"model":"gpt-4o","messages":[]}' } : {}),
@@ -140,4 +173,12 @@ export function proxyRequest(
 export async function errorCode(response: Response): Promise<string> {
   const body = (await response.json()) as { error: { code: string } };
   return body.error.code;
+}
+
+/** Gives the harness tenant an encrypted credential for another provider. */
+export async function addCredential(h: Harness, provider: string, plaintext: string): Promise<void> {
+  h.store.credentials.set(
+    `${TENANT_ID}:${provider}`,
+    await encryptSecret(plaintext, h.encryptionKey, `${TENANT_ID}:${provider}`),
+  );
 }

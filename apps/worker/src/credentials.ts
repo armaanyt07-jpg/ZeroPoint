@@ -1,20 +1,21 @@
 import { decryptSecret } from '@zeropoint/crypto';
 import type { ProviderId } from '@zeropoint/types';
-import type { Directory } from './directory';
 import { ZeroPointError } from './errors';
 
 /**
- * Finds and decrypts the tenant's API key for a provider (FR-1.3).
+ * Decrypts the tenant's API key for a provider (FR-1.3). The ciphertext is
+ * fetched earlier, in parallel with other lookups (see pipeline.ts); this step
+ * only runs once the user has passed the status and budget checks.
+ *
  * The plaintext lives only in this request's memory: it is never logged,
  * cached, or returned to the client.
  */
-export async function resolveProviderCredential(
-  directory: Directory,
+export async function decryptProviderCredential(
+  ciphertext: string | null,
   encryptionKey: string,
   tenantId: string,
   provider: ProviderId,
 ): Promise<string> {
-  const ciphertext = await directory.getEncryptedCredential(tenantId, provider);
   if (!ciphertext) {
     throw new ZeroPointError(
       400,

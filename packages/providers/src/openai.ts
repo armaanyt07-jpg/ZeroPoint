@@ -1,22 +1,18 @@
 import { calculateCostUsd, findPricing } from '@zeropoint/pricing';
 import type { ModelPricing, ProviderUsage } from '@zeropoint/types';
 import type { LLMProviderAdapter } from './adapter';
+import { copyAllowedHeaders, isPostWithBearer, streamingPost } from './shared';
 
 const UPSTREAM_URL = 'https://api.openai.com/v1/chat/completions';
 const SUPPORTED_PATH = '/v1/chat/completions';
 
 /**
- * Only these client headers are passed upstream. An allow-list is safer than a
- * block-list: anything unexpected (proxy key, x-user-id, cookies, cf-* headers)
- * is dropped by default.
+ * `openai-organization` and `openai-project` are deliberately NOT forwarded: they
+ * decide which OpenAI org/project is billed, and that must not be steerable by
+ * whoever holds a proxy key. Requests use the provider key's default org/project.
+ * (Configuring these per tenant is deferred; see docs/PHASE_1.md.)
  */
-const FORWARDED_HEADERS = [
-  'content-type',
-  'accept',
-  'openai-organization',
-  'openai-project',
-  'openai-beta',
-];
+const FORWARDED_HEADERS = ['content-type', 'accept', 'openai-beta'];
 
 export class OpenAIAdapter implements LLMProviderAdapter {
   readonly id = 'openai';
@@ -24,29 +20,19 @@ export class OpenAIAdapter implements LLMProviderAdapter {
   /** Pricing is injected; Phase 1 ships no price table (Phase 2 adds it). */
   constructor(private readonly pricing: readonly ModelPricing[] = []) {}
 
+  matchesPath(pathname: string): boolean {
+    return pathname === SUPPORTED_PATH;
+  }
+
   async authenticate(request: Request): Promise<boolean> {
-    if (request.method !== 'POST') return false;
-    if (new URL(request.url).pathname !== SUPPORTED_PATH) return false;
-    return /^Bearer\s+\S+/i.test(request.headers.get('authorization') ?? '');
+    return isPostWithBearer(request) && this.matchesPath(new URL(request.url).pathname);
   }
 
   async buildProviderRequest(request: Request, providerApiKey: string): Promise<Request> {
-    const headers = new Headers();
-    for (const name of FORWARDED_HEADERS) {
-      const value = request.headers.get(name);
-      if (value !== null) headers.set(name, value);
-    }
+    const headers = copyAllowedHeaders(request, FORWARDED_HEADERS);
     // FR-1.3: the proxy credential is replaced, never forwarded.
     headers.set('authorization', `Bearer ${providerApiKey}`);
-
-    // The body is passed as a stream, so large prompts are never buffered in memory.
-    // `duplex: 'half'` is required by the fetch spec when streaming a request body.
-    return new Request(UPSTREAM_URL, {
-      method: 'POST',
-      headers,
-      body: request.body,
-      duplex: 'half',
-    } as RequestInit);
+    return streamingPost(UPSTREAM_URL, headers, request.body);
   }
 
   /** PHASE 2 STUB: SSE usage extraction is implemented with dual-stream parsing (FR-2.2). */

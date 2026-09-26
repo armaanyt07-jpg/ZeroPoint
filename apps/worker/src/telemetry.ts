@@ -21,7 +21,10 @@ export interface Telemetry {
  * aggregate these. Tags must never contain credentials (NFR-5.2).
  */
 export class ConsoleTelemetry implements Telemetry {
+  /** `baseTags` (e.g. the request_id) are added to every event this instance emits. */
+  constructor(private readonly baseTags: Record<string, string> = {}) {}
+
   increment(metric: MetricName, tags: Record<string, string> = {}): void {
-    console.log(JSON.stringify({ type: 'metric', metric, value: 1, ...tags }));
+    console.log(JSON.stringify({ type: 'metric', metric, value: 1, ...this.baseTags, ...tags }));
   }
 }

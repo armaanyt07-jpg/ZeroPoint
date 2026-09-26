@@ -28,7 +28,12 @@ export class UpstashRedis implements RedisClient {
 
   async get(key: string): Promise<string | null> {
     const result = await this.command(['GET', key]);
-    return typeof result === 'string' ? result : null;
+    if (result === null || result === undefined) return null;
+    // Counters can arrive as JSON numbers. Never drop them: a dropped spend value
+    // would read as "$0 spent" and silently disable the budget guardrail.
+    if (typeof result === 'string') return result;
+    if (typeof result === 'number') return String(result);
+    throw new RedisError('Unexpected Redis GET result type.');
   }
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {

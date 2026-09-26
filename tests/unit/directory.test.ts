@@ -36,6 +36,7 @@ describe('Directory (Redis cache with Postgres fallback)', () => {
     h.redis.failing = true;
     const key = await h.deps.directory.getApiKey(await sha256Hex(PROXY_KEY));
     expect(key?.tenantId).toBe(TENANT_ID);
+    await h.flush(); // the failed cache write is reported from background work
     expect(h.telemetry.count('redis_failures')).toBe(2); // read + write
   });
 

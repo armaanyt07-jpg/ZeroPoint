@@ -7,7 +7,7 @@ import {
 } from '../helpers';
 import { encryptSecret } from '@zeropoint/crypto';
 
-const send = (h: Harness, req: Request) => route(req, () => h.deps);
+const send = (h: Harness, req: Request) => route(req, () => h.deps, h.telemetry);
 
 describe('happy path', () => {
   it('forwards to OpenAI with the provider key, never the proxy key (FR-1.3)', async () => {
@@ -177,7 +177,7 @@ describe('provider selection (FR-1.4)', () => {
     expect(await errorCode(res)).toBe('MISSING_PROVIDER');
   });
 
-  it.each(['anthropic', 'gemini', 'nonsense'])('400 UNSUPPORTED_PROVIDER for %s', async (provider) => {
+  it.each(['cohere', 'nonsense'])('400 UNSUPPORTED_PROVIDER for %s', async (provider) => {
     const h = await createHarness();
     const res = await send(h, proxyRequest({ headers: { 'x-provider': provider } }));
     expect(res.status).toBe(400);
@@ -232,17 +232,21 @@ describe('provider errors are sanitized (SRS section 8)', () => {
     expect(await errorCode(res2)).toBe('PROVIDER_UNREACHABLE');
   });
 
-  it('passes other 4xx through, with Retry-After, but redacts the credential if echoed', async () => {
+  it('normalizes other 4xx into the ZeroPoint error schema, keeping status and Retry-After', async () => {
     const h = await createHarness();
     h.providerFetch.mockResolvedValueOnce(
-      new Response(`{"error":"rate limited for ${PROVIDER_KEY}"}`, { status: 429, headers: { 'retry-after': '7' } }),
+      new Response(`{"error":{"message":"rate limited for ${PROVIDER_KEY}","type":"x","code":"y"}}`, {
+        status: 429,
+        headers: { 'retry-after': '7' },
+      }),
     );
     const res = await send(h, proxyRequest());
     expect(res.status).toBe(429);
     expect(res.headers.get('retry-after')).toBe('7');
-    const text = await res.text();
-    expect(text).not.toContain(PROVIDER_KEY);
-    expect(text).toContain('[redacted]');
+    const body = (await res.json()) as { error: Record<string, unknown> };
+    expect(Object.keys(body.error).sort()).toEqual(['code', 'message']);
+    expect(body.error['code']).toBe('PROVIDER_RATE_LIMITED');
+    expect(body.error['message']).toBe('rate limited for [redacted]');
   });
 });
 

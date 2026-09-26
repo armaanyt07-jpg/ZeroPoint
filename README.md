@@ -2,7 +2,7 @@
 
 Edge AI Gateway & Cost Governance Proxy. See `docs/ZeroPoint_SRS_v1.0.pdf` (source of truth) and `docs/PHASE_1.md`.
 
-**Status: Phase 1** - authenticated edge proxy with pre-flight budget guardrails (OpenAI only).
+**Status: Phase 1** - authenticated edge proxy with pre-flight budget guardrails (OpenAI, Anthropic, Gemini).
 
 ## Requirements
 Node 20+ and pnpm.
@@ -27,4 +27,8 @@ curl -X POST http://localhost:8787/v1/chat/completions \
   -H "Authorization: Bearer pk_live_..." -H "x-user-id: user_123" -H "x-provider: openai" \
   -H "Content-Type: application/json" -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
+`GET /health` reports readiness (503 if secrets are missing). Every proxy response carries an `x-request-id` header; quote it when reporting a problem.
+
+Anthropic: `POST /v1/messages` with `x-provider: anthropic`. Gemini: `POST /v1beta/models/<model>:generateContent` with `x-provider: gemini`. All use `Authorization: Bearer <proxy key>`; the tenant needs an encrypted key row for each provider it uses.
+
 Never commit `.dev.vars` or any real key.

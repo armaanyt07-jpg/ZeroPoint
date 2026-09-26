@@ -27,6 +27,11 @@ export class Directory {
     private readonly redis: RedisClient,
     private readonly store: TenantStore,
     private readonly telemetry: Telemetry,
+    /**
+     * Runs background work without delaying the response. In production this is
+     * `ctx.waitUntil`, which keeps the Worker alive until the promise settles.
+     */
+    private readonly defer: (work: Promise<unknown>) => void = (work) => void work,
   ) {}
 
   getApiKey(keyHash: string): Promise<ApiKeyRecord | null> {
@@ -58,12 +63,14 @@ export class Directory {
     }
 
     const value = await load(); // a database error propagates to the caller
-    try {
-      const ttl = value === null ? NEGATIVE_CACHE_TTL_SECONDS : CACHE_TTL_SECONDS;
-      await this.redis.set(key, JSON.stringify({ v: value }), ttl);
-    } catch {
-      this.telemetry.increment('redis_failures', { operation: 'cache_write' });
-    }
+    // The cache write is not on the critical path: the caller already has its
+    // answer, so we hand the write to `defer` instead of awaiting it.
+    const ttl = value === null ? NEGATIVE_CACHE_TTL_SECONDS : CACHE_TTL_SECONDS;
+    this.defer(
+      this.redis.set(key, JSON.stringify({ v: value }), ttl).catch(() => {
+        this.telemetry.increment('redis_failures', { operation: 'cache_write' });
+      }),
+    );
     return value;
   }
 }

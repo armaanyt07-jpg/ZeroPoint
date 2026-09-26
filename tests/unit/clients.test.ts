@@ -74,4 +74,42 @@ describe('SupabaseStore', () => {
     await expect(store(async () => json([{ id: 'u', budget_limit_usd: 1, status: 'weird' }])).findEndUser('t', 'u')).rejects.toThrow(StoreError);
     await expect(store(async () => { throw new Error('x'); }).findEndUser('t', 'u')).rejects.toThrow(StoreError);
   });
+
+  /**
+   * Review Critical 4 proposed wrapping the value as eq."<value>". That is wrong for
+   * plain filters: PostgREST parses an `eq.` value with `pSingleVal = many anyChar`
+   * (src/library/PostgREST/ApiRequest/QueryParams.hs), i.e. RAW text. Quotes are only
+   * interpreted inside in.(...) and or=(...). Adding them would make every lookup
+   * compare against the literal string "\"user\"", so no user would ever match and
+   * blocking/per-user budgets would silently stop working. These tests pin the correct
+   * behaviour: values are sent unquoted, percent-encoded, and `eq.null` is a plain
+   * string comparison (SQL NULL needs `is.null`).
+   */
+  describe('end-user filter values (PostgREST raw eq. semantics)', () => {
+    const sent = async (externalUserId: string) => {
+      let seen = '';
+      const s = store(async (url) => { seen = url; return json([]); });
+      await s.findEndUser('t', externalUserId);
+      return new URL(seen).searchParams.get('external_user_id');
+    };
+
+    it.each(['null', 'a,b', 'a.b', 'jane@example.com', 'O\'Brien', 'say "hi"', 'a b', 'x(y)', '100%'])(
+      'sends %j as eq.<value> with no added quoting',
+      async (id) => {
+        expect(await sent(id)).toBe(`eq.${id}`);
+      },
+    );
+
+    it('never wraps the value in double quotes', async () => {
+      expect(await sent('user_123')).not.toContain('"');
+    });
+
+    it('round-trips awkward ids through URL encoding', async () => {
+      let raw = '';
+      const s = store(async (url) => { raw = url; return json([]); });
+      await s.findEndUser('t', 'a,b"c&d=e');
+      expect(raw).not.toContain('a,b"c&d=e'); // encoded on the wire
+      expect(new URL(raw).searchParams.get('external_user_id')).toBe('eq.a,b"c&d=e');
+    });
+  });
 });

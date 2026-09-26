@@ -100,3 +100,61 @@ Tests replace Redis, Postgres and the provider with in-memory fakes, so they che
 
 ### How To Verify
 `pnpm check` (typecheck + lint + tests).
+
+## Step 6 - Review remediation (Critical and Major issues)
+
+### What Changed
+Fixes for the Critical and Major findings in `docs/PHASE_1_REVIEW.md`: request accounting, response-header allow-list, numeric Redis values, Anthropic and Gemini adapters with path routing, parallel lookups, `ctx.waitUntil` cache writes, complete rejection metrics, and provider errors in the SRS error schema. One finding (PostgREST quoting) was deliberately not applied; see below.
+
+### Why
+- The metrics counted a failed request as both allowed and rejected, and missed 503/500/404/405.
+- OpenAI response headers (`openai-organization`, `openai-project`) reached clients.
+- A numeric Redis value would have been read as $0 spent.
+- FR-1.4 requires Anthropic and Gemini, and the pre-flight path had three sequential Redis round trips.
+
+### How It Works
+- `pipeline.ts`: `requests_allowed` is recorded after the forward succeeds; `errorToResponse()` records `requests_rejected` for every error type and is reused by `router.ts` for 404/405/config errors.
+- `proxy.ts`: response headers are copied from an allow-list; provider errors are parsed for `error.message`, redacted and re-wrapped as `{ error: { code, message } }`.
+- `packages/providers`: `AnthropicAdapter` (`x-api-key`, `anthropic-version`) and `GeminiAdapter` (`x-goog-api-key`, strict model-path pattern, `?alt=` only). `ProviderRegistry.supportsPath()` drives routing.
+- `pipeline.ts` starts the credential lookup at the same time as the user and spend lookups but awaits it only after the 403/429 checks.
+- `Directory` hands cache writes to `ctx.waitUntil`, so they no longer delay responses.
+
+### Files Changed
+`apps/worker/src/{pipeline,proxy,router,index,deps,directory,credentials,redis,errors}.ts`, `packages/providers/src/{adapter,shared,openai,anthropic,gemini,registry,index}.ts`, `tests/**` (3 new files, helpers extended), `docs/PHASE_1.md`.
+
+### Important Concepts
+- **`ctx.waitUntil`**: runs work after the response is sent, keeping the Worker alive until it finishes.
+- **Allow-list vs deny-list**: copy only known-safe headers instead of removing known-bad ones.
+- **Error precedence**: a request is judged by policy (403, 429) before infrastructure lookups that only matter for forwarding.
+- **PostgREST `eq.` values are raw text**: quoting is only for `in.(...)` / `or=(...)`. The review's suggested quoting would have made every user lookup miss, silently disabling per-user budgets and blocking, so it was not applied.
+
+### How To Verify
+`pnpm check` (typecheck + lint + 161 tests). `pnpm build:check` bundles the Worker.
+
+## Step 7 - Minor review findings
+
+### What Changed
+`/health` hardened, a per-request `x-request-id`, OpenAI organization/project headers no longer forwarded from clients, and a migration adding non-negative budget constraints. The migrations are now executed by an automated test for the first time.
+
+### Why
+- `/health` answered any HTTP verb and reported "ok" even when the Worker had no secrets.
+- Requests could not be correlated across logs and client reports (SRS `request_logs.request_id`).
+- A client could choose which OpenAI org/project was billed.
+- A negative budget would silently block a user or tenant.
+
+### How It Works
+- `router.ts` `health()`: GET/HEAD only; builds the dependencies (which validates the secrets, without network calls) and returns 200 or 503.
+- `index.ts` creates a UUID per request and a `ConsoleTelemetry` stamped with it; `router.ts` `withRequestId()` sets the response header without touching the body, so streaming is unaffected. Client-sent `x-request-id` is ignored.
+- `openai.ts` drops `openai-organization` / `openai-project` from the forwarded-header allow-list.
+- `004_budget_non_negative_checks.sql` adds the two CHECK constraints. `tests/unit/migrations.test.ts` runs all migrations on PGlite (in-process PostgreSQL).
+
+### Files Changed
+`apps/worker/src/{router,index,pipeline,telemetry}.ts`, `packages/providers/src/openai.ts`, `database/migrations/004_budget_non_negative_checks.sql`, `database/README.md`, `tests/integration/minor-fixes.test.ts`, `tests/unit/migrations.test.ts`, dev dependency `@electric-sql/pglite`.
+
+### Important Concepts
+- **Readiness vs liveness**: this `/health` is a readiness check (is the service configured?), not a dependency probe.
+- **Correlation ID**: one id stamped on the response and every log line for a request.
+- **Additive migrations**: change a schema with a new numbered file, never by editing one that may already be applied.
+
+### How To Verify
+`pnpm check`, then `curl -i localhost:8787/health` and look for `x-request-id` on any proxy response.

@@ -19,5 +19,6 @@
       "@zeropoint/providers": ["./packages/providers/src/index.ts"]
     }
   },
-  "include": ["apps", "packages", "tests"]
+  "include": ["apps", "packages", "tests"],
+  "exclude": ["tests/unit/migrations.test.ts"]
 }

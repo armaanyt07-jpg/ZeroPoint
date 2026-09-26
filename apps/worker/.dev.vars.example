@@ -1,0 +1,7 @@
+# Copy to .dev.vars (git-ignored) and fill in. NEVER commit real values.
+UPSTASH_REDIS_REST_URL=https://your-instance.upstash.io
+UPSTASH_REDIS_REST_TOKEN=replace-me
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=replace-me
+# Generate with: pnpm helper gen-encryption-key
+CREDENTIAL_ENCRYPTION_KEY=replace-me

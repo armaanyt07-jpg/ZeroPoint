@@ -1,0 +1,31 @@
+{
+  "name": "zeropoint",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ZeroPoint - Edge AI Gateway & Cost Governance Proxy (Phase 1)",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev --config apps/worker/wrangler.toml",
+    "deploy": "wrangler deploy --config apps/worker/wrangler.toml",
+    "build:check": "wrangler deploy --dry-run --outdir dist --config apps/worker/wrangler.toml",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json",
+    "lint": "eslint .",
+    "check": "pnpm typecheck && pnpm lint && pnpm test",
+    "helper": "tsx scripts/dev-helper.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260925.1",
+    "@types/node": "^26.6.2",
+    "eslint": "^10.11.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.2",
+    "wrangler": "^4.140.0"
+  }
+}

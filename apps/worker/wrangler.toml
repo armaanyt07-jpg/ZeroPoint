@@ -1,0 +1,10 @@
+name = "zeropoint-worker"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# No secrets belong in this file. Set them with:
+#   wrangler secret put UPSTASH_REDIS_REST_URL   (and the others in src/env.ts)
+# For local dev, copy .dev.vars.example to .dev.vars (git-ignored).
+
+[observability]
+enabled = true

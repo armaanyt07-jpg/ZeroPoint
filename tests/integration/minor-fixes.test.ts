@@ -58,6 +58,7 @@ describe('Minor 1: /health', () => {
       UPSTASH_REDIS_REST_URL: 'https://r.test', UPSTASH_REDIS_REST_TOKEN: 't',
       SUPABASE_URL: 'https://d.test', SUPABASE_SERVICE_ROLE_KEY: 's', CREDENTIAL_ENCRYPTION_KEY: 'k',
       USAGE_QUEUE: { send: async () => {} } as never,
+      WEBHOOK_QUEUE: { send: async () => {} } as never,
     };
     expect((await worker.fetch(health(), env, ctx)).status).toBe(200);
   });
@@ -66,7 +67,7 @@ describe('Minor 1: /health', () => {
     const h = await createHarness();
     await send(h, health());
     expect(h.redis.getCalls).toHaveLength(0);
-    expect(h.store.calls).toEqual({ apiKey: 0, endUser: 0, credential: 0 });
+    expect(h.store.calls).toEqual({ apiKey: 0, endUser: 0, credential: 0, policy: 0 });
     expect(h.telemetry.accounting()).toEqual({ total: 0, allowed: 0, rejected: 0 });
   });
 });
@@ -130,6 +131,7 @@ describe('Minor 2: request_id', () => {
         UPSTASH_REDIS_REST_URL: 'https://r.test', UPSTASH_REDIS_REST_TOKEN: 't',
         SUPABASE_URL: 'https://d.test', SUPABASE_SERVICE_ROLE_KEY: 's', CREDENTIAL_ENCRYPTION_KEY: 'k',
         USAGE_QUEUE: { send: async () => {} } as never,
+      WEBHOOK_QUEUE: { send: async () => {} } as never,
       };
       const res = await worker.fetch(
         proxyRequest({ headers: { 'x-request-id': 'client-chosen' } }),

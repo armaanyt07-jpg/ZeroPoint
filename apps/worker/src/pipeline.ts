@@ -1,18 +1,20 @@
 import { assertUserAllowed, authenticate } from './auth';
 import { assertWithinBudget, getCurrentSpend, resolveBudgetLimit } from './budget';
+import { checkPatternHash, hashRequest, readCircuitState } from './circuit-breaker';
 import { decryptProviderCredential } from './credentials';
 import type { Dependencies } from './deps';
 import { StoreError } from './store';
 import { ZeroPointError, errorResponse, toErrorResponse } from './errors';
 import { forwardToProvider } from './proxy';
+import { recordAndNotify } from './settlement';
 import type { Telemetry } from './telemetry';
 
 /**
- * The request lifecycle (SRS sections 2.1 and 7, minus the circuit breaker which
- * arrives in Phase 3):
+ * The request lifecycle (SRS sections 2.1 and 7):
  *
- *   authenticate -> pick provider -> [user + spend + provider key, in parallel]
- *   -> user status -> budget -> (await key) decrypt -> forward
+ *   authenticate -> pick provider -> [user + spend + circuit state, in parallel]
+ *   -> user status -> circuit OPEN? -> budget -> hash request -> loop match?
+ *   -> (await key) decrypt -> forward
  *
  * Metrics invariant: every request increments `requests_total` exactly once and
  * then exactly one of `requests_allowed` (a 2xx was returned to the client) or
@@ -28,6 +30,9 @@ export async function handleProxyRequest(
   // Also the settlement idempotency key (FR-2.4), so it must be a UUID.
   const id = requestId ?? crypto.randomUUID();
   telemetry.increment('requests_total');
+  // FR-3.3 needs to hash the body (D1), so it's cloned before anything reads it.
+  // The original `request` still reaches the adapter with its body untouched.
+  const requestForHashing = request.clone();
   try {
     // 1. FR-1.1: who is calling? (401)
     const auth = await authenticate(request, deps.directory);
@@ -43,24 +48,61 @@ export async function handleProxyRequest(
     }
 
     // 3. Everything below depends only on the tenant (known after step 1) and the
-    //    provider (step 2), so the three lookups run concurrently: one network
-    //    round trip instead of three (NFR-5.1 latency target).
+    //    provider (step 2), so the lookups run concurrently: one network round trip
+    //    instead of several (NFR-5.1 latency target).
     //    The credential lookup is started now but only awaited after the policy
     //    checks, so a credential-store failure can never turn a 403/429 into a 503.
     const credentialLookup = deps.directory.getEncryptedCredential(auth.tenantId, adapter.id);
     credentialLookup.catch(() => {}); // avoid an unhandled rejection if a policy check throws first
-    const [user, spend] = await Promise.all([
+    const [user, spend, circuit] = await Promise.all([
       deps.directory.getEndUser(auth.tenantId, auth.userId),
       getCurrentSpend(deps.redis, telemetry, auth.tenantId, auth.userId),
+      readCircuitState(deps.redis, telemetry, auth.tenantId, auth.userId),
     ]);
 
     // 4. Blocked/suspended users: 403.
     assertUserAllowed(user);
 
-    // 5. FR-1.2: over budget? Stop here, before the provider is ever contacted (429).
+    // 5. FR-3.5: circuit already OPEN (a prior velocity or loop trip)? Stop here,
+    //    before budget or the provider are ever touched (429).
+    if (circuit.open) {
+      throw new ZeroPointError(429, 'CIRCUIT_OPEN', 'AI request temporarily blocked by ZeroPoint protection.', {
+        'retry-after': String(circuit.retryAfterSeconds),
+      });
+    }
+
+    // 6. FR-1.2: over budget? Stop here, before the provider is ever contacted (429).
     assertWithinBudget(spend, resolveBudgetLimit(user, auth.tenantDefaultBudgetUsd));
 
-    // 6. FR-1.3: swap in the tenant's provider credential and forward.
+    // 7. FR-3.3: hash the request; three in a row trips the loop breaker and blocks
+    //    THIS request too (it's the one that completed the pattern). A body over
+    //    the cap (D1) is exempt from hash tracking, not treated as a match/miss.
+    const hash = await hashRequest(adapter.id, new URL(request.url).pathname, requestForHashing.body);
+    if (hash !== null) {
+      const trigger = await checkPatternHash(
+        deps.redis,
+        telemetry,
+        auth.tenantId,
+        auth.userId,
+        hash,
+        Date.now(),
+        auth.tenantPolicy,
+      );
+      if (trigger) {
+        deps.defer(
+          recordAndNotify(auth.tenantId, auth.userId, trigger, auth.tenantPolicy, {
+            store: deps.circuitBreakerStore,
+            webhookQueue: deps.webhookQueue,
+            telemetry,
+          }),
+        );
+        throw new ZeroPointError(429, 'CIRCUIT_OPEN', 'AI request temporarily blocked by ZeroPoint protection.', {
+          'retry-after': String(auth.tenantPolicy.circuitBreakerDurationSeconds),
+        });
+      }
+    }
+
+    // 8. FR-1.3: swap in the tenant's provider credential and forward.
     const providerKey = await decryptProviderCredential(
       await credentialLookup,
       deps.encryptionKey,

@@ -1,8 +1,8 @@
 # ZeroPoint
 
-Edge AI Gateway & Cost Governance Proxy. See `docs/ZeroPoint_SRS_v1.0.pdf` (source of truth), `docs/PHASE_1.md` and `docs/PHASE_2.md`.
+Edge AI Gateway & Cost Governance Proxy. See `docs/ZeroPoint_SRS_v1.0.pdf` (source of truth), `docs/PHASE_1.md`, `docs/PHASE_2.md` and `docs/PHASE_3.md`.
 
-**Status: Phase 2** - authenticated edge proxy with pre-flight budget guardrails (OpenAI, Anthropic, Gemini), plus `tee()` stream inspection and asynchronous, idempotent usage settlement through Cloudflare Queues into Redis and PostgreSQL. Spend only accumulates once model prices are configured (`packages/pricing`; the SRS lists none).
+**Status: Phase 3** - authenticated edge proxy with pre-flight budget guardrails (OpenAI, Anthropic, Gemini), `tee()` stream inspection and asynchronous, idempotent usage settlement through Cloudflare Queues into Redis and PostgreSQL, plus the runaway-agent-loop circuit breaker: a Redis sliding-window spend check, SHA-256 request-pattern loop detection, and queued developer webhooks. Spend only accumulates once model prices are configured (`packages/pricing`; the SRS lists none).
 
 ## Requirements
 Node 20+ and pnpm.

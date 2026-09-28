@@ -1,4 +1,5 @@
 import { getCurrentSpend, spendKey } from '../../apps/worker/src/budget';
+import { circuitKey } from '../../apps/worker/src/circuit-breaker';
 import {
   InvalidUsageEventError,
   SETTLED_TTL_SECONDS,
@@ -11,7 +12,7 @@ import {
 } from '../../apps/worker/src/settlement';
 import type { UsageEvent } from '@zeropoint/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { FakeMessage, FakeRedis, FakeTelemetry, FakeUsageStore, TENANT_ID, USER_ID } from '../helpers';
+import { DEFAULT_TENANT_POLICY, FakeMessage, FakeRedis, FakeTelemetry, FakeUsageStore, FakeWebhookQueue, TENANT_ID, USER_ID } from '../helpers';
 
 const event = (overrides: Partial<UsageEvent> = {}): UsageEvent => ({
   requestId: '22222222-2222-2222-2222-222222222222',
@@ -35,7 +36,8 @@ function setup() {
   const redis = new FakeRedis();
   const store = new FakeUsageStore();
   const telemetry = new FakeTelemetry();
-  return { redis, store, telemetry, deps: { redis, store, telemetry } };
+  const webhookQueue = new FakeWebhookQueue();
+  return { redis, store, telemetry, webhookQueue, deps: { redis, store, telemetry, webhookQueue } };
 }
 const spendOf = (redis: FakeRedis) => Number(redis.data.get(spendKey(TENANT_ID, USER_ID)));
 
@@ -219,5 +221,83 @@ describe('handleUsageBatch (queue consumer)', () => {
 
   it('backoff grows and is capped', () => {
     expect([1, 2, 3, 4, 5, 6, 7, 20].map(retryDelaySeconds)).toEqual([15, 30, 60, 120, 240, 480, 600, 600]);
+  });
+});
+
+describe('settleUsageEvent tracks velocity and trips the breaker (FR-3.1/3.2/3.4)', () => {
+  it('opens the circuit once cumulative cost within the window exceeds the threshold', async () => {
+    const { redis, store, deps } = setup();
+    await settleUsageEvent(event({ requestId: '88888888-8888-8888-8888-888888888888', estimatedCostUsd: 1.5 }), deps);
+    expect(redis.data.has(circuitKey(TENANT_ID, USER_ID))).toBe(false);
+    await settleUsageEvent(event({ requestId: '99999999-9999-9999-9999-999999999999', estimatedCostUsd: 1.5 }), deps);
+    expect(redis.data.get(circuitKey(TENANT_ID, USER_ID))).toMatch(/^velocity:\d+$/);
+    expect(store.circuitBreakerEvents).toEqual([
+      { tenantId: TENANT_ID, externalUserId: USER_ID, reason: 'velocity', openedAt: expect.any(String), expiresAt: expect.any(String) },
+    ]);
+  });
+
+  it('emits circuit_breaker_events telemetry only on the trip, not on every settle', async () => {
+    const { telemetry, deps } = setup();
+    await settleUsageEvent(event({ requestId: '11111111-2222-3333-4444-555555555555', estimatedCostUsd: 1.5 }), deps);
+    expect(telemetry.count('circuit_breaker_events')).toBe(0);
+    await settleUsageEvent(event({ requestId: '22222222-3333-4444-5555-666666666666', estimatedCostUsd: 1.5 }), deps);
+    expect(telemetry.count('circuit_breaker_events')).toBe(1);
+  });
+
+  it('does not double-count velocity on a duplicate redelivery', async () => {
+    const { redis, deps } = setup();
+    const e = event({ requestId: '33333333-4444-5555-6666-777777777777', estimatedCostUsd: 3 }); // alone, over threshold
+    await settleUsageEvent(e, deps); // first delivery: trips
+    redis.data.delete(circuitKey(TENANT_ID, USER_ID)); // simulate the circuit having since closed
+    await settleUsageEvent(e, deps); // redelivery: redisApplied=false, must not re-track
+    expect(redis.data.has(circuitKey(TENANT_ID, USER_ID))).toBe(false);
+  });
+
+  it('dispatches a webhook only when the tenant has webhook_url configured', async () => {
+    const { store, webhookQueue, deps } = setup();
+    store.policies.set(TENANT_ID, { ...DEFAULT_TENANT_POLICY, webhookUrl: 'https://tenant.example/hook' });
+    await settleUsageEvent(event({ requestId: '44444444-5555-6666-7777-888888888888', estimatedCostUsd: 3 }), deps);
+    expect(webhookQueue.sent).toEqual([
+      {
+        tenantId: TENANT_ID,
+        externalUserId: USER_ID,
+        webhookUrl: 'https://tenant.example/hook',
+        reason: 'velocity',
+        openedAt: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+    ]);
+  });
+
+  it('no webhook_url configured (the default): nothing is queued', async () => {
+    const { webhookQueue, deps } = setup();
+    await settleUsageEvent(event({ requestId: '55555555-6666-7777-8888-999999999999', estimatedCostUsd: 3 }), deps);
+    expect(webhookQueue.sent).toHaveLength(0);
+  });
+
+  it('a lower per-tenant velocity_limit_usd is honored', async () => {
+    const { redis, store, deps } = setup();
+    store.policies.set(TENANT_ID, { ...DEFAULT_TENANT_POLICY, velocityLimitUsd: 0.01 });
+    await settleUsageEvent(event({ requestId: '66666666-7777-8888-9999-aaaaaaaaaaaa', estimatedCostUsd: 0.02 }), deps);
+    expect(redis.data.has(circuitKey(TENANT_ID, USER_ID))).toBe(true);
+  });
+
+  it('a failure recording the audit event never fails settlement (best-effort, D4)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { store, deps } = setup();
+    store.recordCircuitBreakerEvent = async () => {
+      throw new Error('db down');
+    };
+    await expect(
+      settleUsageEvent(event({ requestId: '77777777-8888-9999-aaaa-bbbbbbbbbbbb', estimatedCostUsd: 3 }), deps),
+    ).resolves.toEqual({ redisApplied: true, databaseApplied: true });
+  });
+
+  it('a missing tenant policy row never throws (settlement stays correct; velocity is just skipped)', async () => {
+    const { store, deps } = setup();
+    store.findTenantPolicy = async () => null;
+    await expect(
+      settleUsageEvent(event({ requestId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }), deps),
+    ).resolves.toEqual({ redisApplied: true, databaseApplied: true });
   });
 });

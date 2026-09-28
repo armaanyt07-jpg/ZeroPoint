@@ -214,3 +214,44 @@ See the Tests section of `docs/PHASE_2.md`. A throwaway `wrangler dev` harness c
 `tests/**`, `package.json` (`fengari`), `docs/PHASE_2.md`, `docs/CHANGELOG.md`, `README.md`.
 ### How To Verify
 `pnpm check` and `pnpm build:check`.
+
+## Step 12 - Phase 3 plan
+### What Changed
+`docs/PHASE_3_PLAN.md`: the SRS Phase 3 requirements mapped to files, where velocity vs. loop detection each run in the request lifecycle, and decisions D1-D7.
+### Why
+Phase 3 changes the request pipeline's control flow (a new 429 path before budget/forward), adds a second Cloudflare Queue, and needed a schema decision (a new audit table) before any code changed.
+### Files Changed
+`docs/PHASE_3_PLAN.md`.
+### How To Verify
+Read it against `docs/ZeroPoint_SRS_v1.0.pdf` sections 3 (Phase 3), 6.4, 7, 10-13.
+
+## Step 13 - Circuit breaker (FR-3.1-3.5, FR-3.7)
+### What Changed
+Velocity tracking (Redis sorted sets) and pattern-hash loop detection (Redis lists), both as atomic Lua scripts; the circuit state check wired into the request pipeline before budget and before the provider; a second queue and consumer for developer webhooks; a new audit table.
+### Why
+A runaway agent loop must be stopped by dollars-per-minute (an agent calling an expensive model repeatedly) and by exact-repeat pattern (an agent stuck retrying the identical call), and the tenant needs to be told without that notification ever slowing down or failing a request.
+### How It Works
+- `circuit-breaker.ts`: `VELOCITY_SCRIPT` (`ZADD`/`ZREMRANGEBYSCORE`/sum/threshold, guarded by an `EXISTS` check so an open circuit is never re-tripped) and `HASH_SCRIPT` (`LPUSH`/`LTRIM` to 5/last-3-equal, same guard). Circuit value is `"<reason>:<expiresAtMs>"` — no `cjson`, so the exact script text can run inside a plain Lua VM in tests.
+- `pipeline.ts`: circuit state is read in the same parallel batch as end-user/spend (step 3); an OPEN circuit 429s before budget (step 5). After budget passes, the request body is hashed from a `Request.clone()` (step 7); three consecutive matches 429 this request too, and defer the audit write + webhook.
+- `settlement.ts`: after a newly-settled usage event, `checkVelocity` runs against the tenant's window/threshold; a trip records the event and queues a webhook, same code path (`recordAndNotify`) the pipeline's loop trip uses.
+- `webhook-queue.ts`/`webhook-dispatch.ts`: a `WEBHOOK_QUEUE` binding, retried with backoff like the usage queue, POSTing `{event, tenant_id, external_user_id, reason, opened_at, expires_at}` to `tenants.webhook_url`.
+- `store.ts`: `findApiKeyByHash`'s embedded `tenants(...)` select grows to include `velocity_limit_usd`/`velocity_window_seconds`/`circuit_breaker_duration_seconds`/`webhook_url` (all already in the SRS schema, unused until now); `findTenantPolicy` for settlement (no API key there); `recordCircuitBreakerEvent` (best-effort insert).
+- Migration 006: `circuit_breaker_events` (additive, not in SRS 4.3).
+### Files Changed
+`apps/worker/src/{circuit-breaker,webhook-queue,webhook-dispatch,pipeline,settlement,store,auth,deps,env,index,errors}.ts`, `apps/worker/wrangler.toml`, `database/migrations/006_circuit_breaker.sql`, `database/README.md`, `packages/types`.
+### Important Concepts
+Redis sorted sets as a sliding window, atomic Lua scripts as a full read-decide-write, `Request.clone()` for a second independent body read (and the `cancel()`-must-not-be-awaited gotcha it shares with Phase 2's `tee()`).
+### How To Verify
+`pnpm test tests/unit/circuit-breaker.test.ts tests/unit/webhook-queue.test.ts tests/unit/webhook-dispatch.test.ts tests/integration/circuit-breaker.test.ts`
+
+## Step 14 - Phase 3 tests and verification
+### What Changed
+67 new tests (385 total), the test Lua-VM shim extended with sorted-set/list commands so the real `VELOCITY_SCRIPT`/`HASH_SCRIPT` execute in tests, `docs/PHASE_3.md`, README status.
+### Why
+Same principle as Phase 2's Step 11: every new behaviour needed a test that fails when it breaks, and the shipped Lua text is what gets executed, not a JS re-implementation of it.
+### How It Works
+See the Tests section of `docs/PHASE_3.md`. Two real bugs were caught this way: an inclusive-range off-by-one in the test Lua shim that under-counted the velocity sum by one entry, and a hang from awaiting `cancel()` on a cloned request's body reader before its sibling branch was drained.
+### Files Changed
+`tests/**`, `docs/PHASE_3.md`, `docs/CHANGELOG.md`, `README.md`, `database/README.md`.
+### How To Verify
+`pnpm check` and `pnpm build:check`.

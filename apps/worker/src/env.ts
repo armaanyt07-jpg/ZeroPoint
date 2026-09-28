@@ -1,4 +1,4 @@
-import type { UsageEvent } from '@zeropoint/types';
+import type { UsageEvent, WebhookEvent } from '@zeropoint/types';
 
 /**
  * Runtime configuration. Non-secret values could live in wrangler.toml [vars];
@@ -17,4 +17,9 @@ export interface Env {
    * Carries usage events from the request path to the settlement consumer (FR-2.3).
    */
   USAGE_QUEUE: Queue<UsageEvent>;
+  /**
+   * Cloudflare Queue producer binding (not a secret; declared in wrangler.toml).
+   * Carries circuit-breaker notifications to the webhook-delivery consumer (FR-3.7).
+   */
+  WEBHOOK_QUEUE: Queue<WebhookEvent>;
 }

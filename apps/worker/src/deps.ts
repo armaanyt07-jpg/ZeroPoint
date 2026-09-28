@@ -1,11 +1,12 @@
 import { UpstashRedis, type RedisClient } from './redis';
 import { Directory } from './directory';
 import { ZeroPointError } from './errors';
-import { SupabaseStore } from './store';
+import { SupabaseStore, type CircuitBreakerStore } from './store';
 import type { SettlementDeps } from './settlement';
 import type { Telemetry } from './telemetry';
 import type { Env } from './env';
 import type { UsageQueue } from './usage-queue';
+import type { WebhookQueue } from './webhook-queue';
 import { createDefaultRegistry, type ProviderRegistry } from '@zeropoint/providers';
 
 /** Everything the request pipeline needs. Tests build this with fakes. */
@@ -18,6 +19,10 @@ export interface Dependencies {
   fetch: typeof fetch;
   /** Where usage events go for asynchronous settlement (FR-2.3). */
   usageQueue: UsageQueue;
+  /** Where circuit-breaker webhook notifications go (FR-3.7). */
+  webhookQueue: WebhookQueue;
+  /** Records circuit-breaker trips for the audit trail (FR-3.4). */
+  circuitBreakerStore: CircuitBreakerStore;
   /** Runs work after the response is returned (`ctx.waitUntil`). */
   defer: (work: Promise<unknown>) => void;
 }
@@ -29,6 +34,7 @@ const REQUIRED: (keyof Env)[] = [
   'SUPABASE_SERVICE_ROLE_KEY',
   'CREDENTIAL_ENCRYPTION_KEY',
   'USAGE_QUEUE',
+  'WEBHOOK_QUEUE',
 ];
 
 /** Wires real infrastructure clients from Worker secrets/bindings. */
@@ -58,11 +64,17 @@ export function createDependencies(
         await env.USAGE_QUEUE.send(event);
       },
     },
+    webhookQueue: {
+      send: async (event) => {
+        await env.WEBHOOK_QUEUE.send(event);
+      },
+    },
+    circuitBreakerStore: store,
     defer,
   };
 }
 
-/** Wires the queue consumer's clients. Settlement is not latency-sensitive, so the timeouts are generous. */
+/** Wires the queue consumers' clients. Settlement is not latency-sensitive, so the timeouts are generous. */
 export function createSettlementDependencies(env: Env, telemetry: Telemetry): SettlementDeps {
   const missing = (['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'] as const).filter(
     (name) => !env[name],
@@ -80,5 +92,10 @@ export function createSettlementDependencies(env: Env, telemetry: Telemetry): Se
     ),
     store: new SupabaseStore(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY),
     telemetry,
+    webhookQueue: {
+      send: async (event) => {
+        await env.WEBHOOK_QUEUE.send(event);
+      },
+    },
   };
 }

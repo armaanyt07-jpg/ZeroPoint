@@ -1,9 +1,12 @@
 import type { UsageEvent, UsageSource } from '@zeropoint/types';
 import { spendKey } from './budget';
+import { checkVelocity } from './circuit-breaker';
 import type { RedisClient } from './redis';
 import { RedisError } from './redis';
-import type { UsageStore } from './store';
+import type { CircuitBreakerStore, TenantStore, UsageStore } from './store';
 import type { Telemetry } from './telemetry';
+import { dispatchWebhookEvent } from './webhook-queue';
+import type { WebhookQueue } from './webhook-queue';
 
 /** SRS section 10: settlement idempotency key. */
 export const settledKey = (requestId: string) => `settled:${requestId}`;
@@ -34,8 +37,9 @@ return 0
 /** The dependencies the queue consumer needs. */
 export interface SettlementDeps {
   redis: RedisClient;
-  store: UsageStore;
+  store: UsageStore & CircuitBreakerStore & Pick<TenantStore, 'findTenantPolicy'>;
   telemetry: Telemetry;
+  webhookQueue: WebhookQueue;
 }
 
 export class InvalidUsageEventError extends Error {
@@ -105,7 +109,62 @@ export async function settleUsageEvent(body: unknown, deps: SettlementDeps): Pro
   }
 
   const databaseApplied = await deps.store.settleUsage(event);
+
+  // FR-3.1/3.2: burn-rate is only meaningful for cost newly counted just now (a
+  // duplicate redelivery already contributed its cost on the first attempt).
+  if (redisApplied) await trackVelocity(event, deps);
+
   return { redisApplied, databaseApplied };
+}
+
+/**
+ * Checks whether this settled request pushes the user's 60-second (configurable)
+ * spend over their tenant's threshold, and if so opens the circuit and notifies
+ * (FR-3.1/3.2/3.4). Never throws: a failure here must not turn a successful
+ * settlement into a retried queue message (money is already correctly accounted
+ * for by this point), so every error is caught and logged instead.
+ */
+async function trackVelocity(event: UsageEvent, deps: SettlementDeps): Promise<void> {
+  try {
+    const policy = await deps.store.findTenantPolicy(event.tenantId);
+    if (!policy) return; // tenant row missing is a data-integrity problem, not this request's fault
+    const trigger = await checkVelocity(
+      deps.redis,
+      deps.telemetry,
+      event.tenantId,
+      event.externalUserId,
+      event.requestId,
+      event.estimatedCostUsd,
+      Date.parse(event.occurredAt),
+      policy,
+    );
+    if (trigger) await recordAndNotify(event.tenantId, event.externalUserId, trigger, policy, deps);
+  } catch (error) {
+    console.error(JSON.stringify({ type: 'velocity_check_error', name: (error as Error)?.name }));
+  }
+}
+
+/** Shared by the velocity (settlement.ts) and loop (pipeline.ts) triggers. */
+export async function recordAndNotify(
+  tenantId: string,
+  externalUserId: string,
+  trigger: { reason: 'velocity' | 'loop'; openedAt: string; expiresAt: string },
+  policy: { webhookUrl: string | null },
+  deps: { store: CircuitBreakerStore; webhookQueue: WebhookQueue; telemetry: Telemetry },
+): Promise<void> {
+  deps.telemetry.increment('circuit_breaker_events', { reason: trigger.reason });
+
+  try {
+    await deps.store.recordCircuitBreakerEvent({ tenantId, externalUserId, ...trigger });
+  } catch (error) {
+    // Best-effort audit trail (docs/PHASE_3_PLAN.md D4): the circuit is already open
+    // in Redis regardless of whether this write succeeds.
+    console.error(JSON.stringify({ type: 'circuit_breaker_event_record_failed', name: (error as Error)?.name }));
+  }
+
+  if (policy.webhookUrl) {
+    await dispatchWebhookEvent(deps.webhookQueue, { tenantId, externalUserId, webhookUrl: policy.webhookUrl, ...trigger }, deps.telemetry);
+  }
 }
 
 /** The slice of a Cloudflare queue message the consumer uses (so tests can fake it). */

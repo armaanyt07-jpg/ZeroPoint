@@ -65,3 +65,28 @@ export interface ModelPricing {
 
 export type EndUserStatus = 'active' | 'blocked' | 'suspended';
 export type ApiKeyStatus = 'active' | 'revoked';
+
+/** Why a circuit breaker opened (FR-3.1/3.2 vs FR-3.3). */
+export type CircuitBreakerReason = 'velocity' | 'loop';
+
+/** Per-tenant governance policy (SRS 4.3 `tenants` columns, Phase 3). */
+export interface TenantPolicy {
+  velocityLimitUsd: number;
+  velocityWindowSeconds: number;
+  circuitBreakerDurationSeconds: number;
+  webhookUrl: string | null;
+}
+
+/** Record of a circuit breaker opening (FR-3.4 "record the event"). Metadata only. */
+export interface CircuitBreakerEvent {
+  tenantId: string;
+  externalUserId: string;
+  reason: CircuitBreakerReason;
+  openedAt: string;
+  expiresAt: string;
+}
+
+/** The message sent through Cloudflare Queues for developer notification (FR-3.7). */
+export interface WebhookEvent extends CircuitBreakerEvent {
+  webhookUrl: string;
+}

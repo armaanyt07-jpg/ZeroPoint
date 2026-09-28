@@ -3,6 +3,7 @@ import type { Env } from './env';
 import { route } from './router';
 import { handleUsageBatch } from './settlement';
 import { ConsoleTelemetry } from './telemetry';
+import { handleWebhookBatch } from './webhook-dispatch';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -18,11 +19,17 @@ export default {
   },
 
   /**
-   * Cloudflare Queues consumer (FR-2.3): settles usage events in the background.
-   * A configuration error throws, so the whole batch is redelivered rather than lost.
+   * Cloudflare Queues consumer, shared by two queues distinguished by `batch.queue`
+   * (FR-2.3: usage settlement; FR-3.7: circuit-breaker webhooks). A configuration
+   * error throws, so the whole batch is redelivered rather than lost.
    */
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
-    const deps = createSettlementDependencies(env, new ConsoleTelemetry());
+    const telemetry = new ConsoleTelemetry();
+    if (batch.queue === 'zeropoint-webhooks') {
+      await handleWebhookBatch(batch.messages, telemetry, (input, init) => fetch(input, init));
+      return;
+    }
+    const deps = createSettlementDependencies(env, telemetry);
     await handleUsageBatch(batch.messages, deps);
   },
 } satisfies ExportedHandler<Env>;

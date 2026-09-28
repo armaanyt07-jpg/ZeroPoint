@@ -168,7 +168,7 @@ describe('Major 2: pre-flight latency structure (NFR-5.1)', () => {
     await h.flush();
     h.redis.getCalls = [];
     await send(h, proxyRequest());
-    expect(h.redis.getCalls).toHaveLength(4); // apikey, enduser, spend, credential
+    expect(h.redis.getCalls).toHaveLength(5); // apikey, enduser, spend, circuit state, credential
     expect(h.redis.getCalls[0]).toMatch(/^cache:apikey:/);
   });
 
@@ -240,7 +240,20 @@ describe('Major 3: ExecutionContext and non-blocking cache writes', () => {
         }
         if (url.origin === 'https://db.test') {
           const rows: Record<string, unknown[]> = {
-            '/rest/v1/api_keys': [{ id: 'k1', tenant_id: TENANT_ID, status: 'active', tenants: { default_budget_usd: 20 } }],
+            '/rest/v1/api_keys': [
+              {
+                id: 'k1',
+                tenant_id: TENANT_ID,
+                status: 'active',
+                tenants: {
+                  default_budget_usd: 20,
+                  velocity_limit_usd: 2,
+                  velocity_window_seconds: 60,
+                  circuit_breaker_duration_seconds: 900,
+                  webhook_url: null,
+                },
+              },
+            ],
             '/rest/v1/end_users': [],
             '/rest/v1/tenant_provider_credentials': [{ encrypted_api_key: credential }],
           };
@@ -262,6 +275,7 @@ describe('Major 3: ExecutionContext and non-blocking cache writes', () => {
         SUPABASE_SERVICE_ROLE_KEY: 's',
         CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
         USAGE_QUEUE: { send: async () => {} } as never,
+      WEBHOOK_QUEUE: { send: async () => {} } as never,
       };
       const res = await worker.fetch(proxyRequest(), env, { waitUntil } as unknown as ExecutionContext);
       expect(res.status).toBe(200);
@@ -381,14 +395,16 @@ describe('Major 5: provider 4xx errors use the SRS error schema', () => {
 
   it('does not leak the key even when the provider echoes it masked or URL-encoded', async () => {
     const h = await createHarness();
-    for (const echoed of [
+    // Each iteration sends a distinct body (Phase 3's `n` marker) so the loop
+    // breaker (FR-3.3) never sees four identical requests from the same user.
+    for (const [n, echoed] of [
       `Bad key ${PROVIDER_KEY}`,
       'Incorrect key: sk-proj-****abcd',
       'key sk-ant-api03-abcdefgh1234 invalid',
       'key AIzaSyA1234567890abcdefg invalid',
-    ]) {
+    ].entries()) {
       h.providerFetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: echoed } }), { status: 400 }));
-      const text = await (await send(h, proxyRequest())).text();
+      const text = await (await send(h, proxyRequest({ body: `{"model":"gpt-4o","messages":[],"n":${n}}` }))).text();
       expect(text).not.toMatch(/sk-proj|sk-ant|AIza|sk-provider-secret/);
       expect(text).toContain('[redacted]');
     }
@@ -396,9 +412,10 @@ describe('Major 5: provider 4xx errors use the SRS error schema', () => {
 
   it('still hides provider 401/403 and 5xx behind 502s', async () => {
     const h = await createHarness();
-    for (const [status, code] of [[401, 'PROVIDER_AUTH_ERROR'], [403, 'PROVIDER_AUTH_ERROR'], [500, 'PROVIDER_ERROR'], [503, 'PROVIDER_ERROR']] as const) {
+    // Same reasoning as above: a distinct body per iteration avoids tripping FR-3.3.
+    for (const [n, [status, code]] of ([[401, 'PROVIDER_AUTH_ERROR'], [403, 'PROVIDER_AUTH_ERROR'], [500, 'PROVIDER_ERROR'], [503, 'PROVIDER_ERROR']] as const).entries()) {
       h.providerFetch.mockResolvedValueOnce(new Response(`{"error":{"message":"${PROVIDER_KEY}"}}`, { status }));
-      const res = await send(h, proxyRequest());
+      const res = await send(h, proxyRequest({ body: `{"model":"gpt-4o","messages":[],"n":${n}}` }));
       expect(res.status).toBe(502);
       expect(await errorCode(res)).toBe(code);
     }

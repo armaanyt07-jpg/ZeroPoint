@@ -9,3 +9,4 @@ Plain SQL, applied in filename order to Supabase PostgreSQL (SQL editor or `psql
 | `003_enable_row_level_security.sql` | Deny public API access; only the service-role key can read |
 | `004_budget_non_negative_checks.sql` | `CHECK (budget >= 0)` on tenant and per-user budgets - **addition, not in SRS** |
 | `005_settlement.sql` | Phase 2: widens `end_users.current_spend_usd` to `NUMERIC(14,8)` and adds the idempotent `settle_usage()` function (service-role only) - **addition, not in SRS** |
+| `006_circuit_breaker.sql` | Phase 3: `circuit_breaker_events` audit table (FR-3.4 "record the event") - **addition, not in SRS** |

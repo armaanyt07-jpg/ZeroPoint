@@ -35,15 +35,32 @@ describe('SupabaseStore', () => {
   const store = (f: (url: string, init: RequestInit) => Promise<Response>) =>
     new SupabaseStore('https://p.supabase.co', 'svc', f as unknown as typeof fetch);
 
-  it('looks up an api key by hash, embedding the tenant budget', async () => {
+  it('looks up an api key by hash, embedding the tenant budget and Phase 3 policy', async () => {
     let seen = '';
     const s = store(async (url, init) => {
       seen = url;
       expect((init.headers as Record<string, string>)['apikey']).toBe('svc');
-      return json([{ id: 'k1', tenant_id: 't1', status: 'active', tenants: { default_budget_usd: '20.0000' } }]);
+      return json([
+        {
+          id: 'k1',
+          tenant_id: 't1',
+          status: 'active',
+          tenants: {
+            default_budget_usd: '20.0000',
+            velocity_limit_usd: '2.0000',
+            velocity_window_seconds: 60,
+            circuit_breaker_duration_seconds: 900,
+            webhook_url: null,
+          },
+        },
+      ]);
     });
     expect(await s.findApiKeyByHash('abc')).toEqual({
-      apiKeyId: 'k1', tenantId: 't1', status: 'active', defaultBudgetUsd: 20,
+      apiKeyId: 'k1',
+      tenantId: 't1',
+      status: 'active',
+      defaultBudgetUsd: 20,
+      policy: { velocityLimitUsd: 2, velocityWindowSeconds: 60, circuitBreakerDurationSeconds: 900, webhookUrl: null },
     });
     expect(seen).toContain('/rest/v1/api_keys?');
     expect(seen).toContain('key_hash=eq.abc');
@@ -160,5 +177,70 @@ describe('SupabaseStore.settleUsage (Phase 2)', () => {
     await expect(store(async () => json({}, 500)).settleUsage(event)).rejects.toThrow(StoreError);
     await expect(store(async () => { throw new Error('x'); }).settleUsage(event)).rejects.toThrow(StoreError);
     await expect(store(async () => json({ nope: 1 })).settleUsage(event)).rejects.toThrow(StoreError);
+  });
+});
+
+describe('SupabaseStore.findTenantPolicy (Phase 3)', () => {
+  const store = (f: (url: string, init: RequestInit) => Promise<Response>) =>
+    new SupabaseStore('https://p.supabase.co', 'svc', f as unknown as typeof fetch);
+
+  it('reads the tenant policy columns by id', async () => {
+    let seen = '';
+    const s = store(async (url) => {
+      seen = url;
+      return json([
+        { velocity_limit_usd: '2.0000', velocity_window_seconds: 60, circuit_breaker_duration_seconds: 900, webhook_url: 'https://x.example/hook' },
+      ]);
+    });
+    expect(await s.findTenantPolicy('t1')).toEqual({
+      velocityLimitUsd: 2, velocityWindowSeconds: 60, circuitBreakerDurationSeconds: 900, webhookUrl: 'https://x.example/hook',
+    });
+    expect(seen).toContain('/rest/v1/tenants?');
+    expect(seen).toContain('id=eq.t1');
+  });
+
+  it('a null webhook_url stays null', async () => {
+    const s = store(async () =>
+      json([{ velocity_limit_usd: 2, velocity_window_seconds: 60, circuit_breaker_duration_seconds: 900, webhook_url: null }]),
+    );
+    expect((await s.findTenantPolicy('t1'))!.webhookUrl).toBeNull();
+  });
+
+  it('returns null when the tenant row is missing', async () => {
+    expect(await store(async () => json([])).findTenantPolicy('nope')).toBeNull();
+  });
+
+  it('throws StoreError on a malformed row', async () => {
+    await expect(store(async () => json([{ velocity_limit_usd: 'not-a-number' }])).findTenantPolicy('t1')).rejects.toThrow(StoreError);
+  });
+});
+
+describe('SupabaseStore.recordCircuitBreakerEvent (Phase 3, FR-3.4 "record the event")', () => {
+  const event = {
+    tenantId: 't1', externalUserId: 'u1', reason: 'loop' as const,
+    openedAt: '2026-09-28T00:00:00.000Z', expiresAt: '2026-09-28T00:15:00.000Z',
+  };
+  const store = (f: (url: string, init: RequestInit) => Promise<Response>) =>
+    new SupabaseStore('https://p.supabase.co', 'svc', f as unknown as typeof fetch);
+
+  it('POSTs the event with the service-role key', async () => {
+    let seen: { url: string; init: RequestInit } | undefined;
+    const s = store(async (url, init) => {
+      seen = { url, init };
+      return new Response(null, { status: 201 });
+    });
+    await s.recordCircuitBreakerEvent(event);
+    expect(seen!.url).toBe('https://p.supabase.co/rest/v1/circuit_breaker_events');
+    expect(seen!.init.method).toBe('POST');
+    expect((seen!.init.headers as Record<string, string>)['apikey']).toBe('svc');
+    expect(JSON.parse(seen!.init.body as string)).toEqual({
+      tenant_id: 't1', external_user_id: 'u1', reason: 'loop',
+      opened_at: '2026-09-28T00:00:00.000Z', expires_at: '2026-09-28T00:15:00.000Z',
+    });
+  });
+
+  it('throws StoreError on HTTP errors and network failures (the caller decides how to handle it)', async () => {
+    await expect(store(async () => json({}, 500)).recordCircuitBreakerEvent(event)).rejects.toThrow(StoreError);
+    await expect(store(async () => { throw new Error('x'); }).recordCircuitBreakerEvent(event)).rejects.toThrow(StoreError);
   });
 });

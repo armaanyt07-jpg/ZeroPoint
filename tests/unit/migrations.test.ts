@@ -30,7 +30,7 @@ describe('migrations apply cleanly, in order', () => {
   it('creates every table', async () => {
     const { rows } = await db.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1`);
     expect(rows.map((r) => (r as { table_name: string }).table_name)).toEqual([
-      'api_keys', 'end_users', 'request_logs', 'tenant_provider_credentials', 'tenants',
+      'api_keys', 'circuit_breaker_events', 'end_users', 'request_logs', 'tenant_provider_credentials', 'tenants',
     ]);
   });
 
@@ -172,5 +172,44 @@ describe('settlement (migration 005, FR-2.3 / FR-2.4)', () => {
   it('is not executable by PUBLIC (RLS does not protect functions; only service_role may call it)', async () => {
     const { rows } = await db.query(`SELECT has_function_privilege('public', 'settle_usage(uuid,uuid,text,text,text,integer,bigint,bigint,bigint,numeric,text,integer,boolean,timestamptz)', 'EXECUTE') AS ok`);
     expect((rows[0] as { ok: boolean }).ok).toBe(false);
+  });
+});
+
+describe('circuit_breaker_events (migration 006, FR-3.4 "record the event")', () => {
+  it('records a trip without requiring an end_users row to already exist', async () => {
+    const tenant = await newTenant();
+    const row = await one(
+      `INSERT INTO circuit_breaker_events (tenant_id, external_user_id, reason, opened_at, expires_at)
+       VALUES ($1, 'user_never_settled', 'loop', NOW(), NOW() + INTERVAL '15 minutes') RETURNING id, reason`,
+      [tenant],
+    );
+    expect(row['reason']).toBe('loop');
+    expect(row['id']).toBeTruthy();
+  });
+
+  it('only accepts velocity or loop as a reason', async () => {
+    const tenant = await newTenant();
+    await expect(
+      db.query(
+        `INSERT INTO circuit_breaker_events (tenant_id, external_user_id, reason, opened_at, expires_at) VALUES ($1,'u','guess',NOW(),NOW())`,
+        [tenant],
+      ),
+    ).rejects.toThrow(/check/i);
+  });
+
+  it('is deleted when its tenant is deleted (cascade, like the other tenant-scoped tables)', async () => {
+    const tenant = await newTenant();
+    await db.query(
+      `INSERT INTO circuit_breaker_events (tenant_id, external_user_id, reason, opened_at, expires_at) VALUES ($1,'u','velocity',NOW(),NOW())`,
+      [tenant],
+    );
+    await db.query(`DELETE FROM tenants WHERE id=$1`, [tenant]);
+    const { rows } = await db.query(`SELECT 1 FROM circuit_breaker_events WHERE tenant_id=$1`, [tenant]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('has row level security enabled, like every other table', async () => {
+    const { rows } = await db.query(`SELECT relrowsecurity FROM pg_class WHERE relname='circuit_breaker_events'`);
+    expect((rows[0] as { relrowsecurity: boolean }).relrowsecurity).toBe(true);
   });
 });

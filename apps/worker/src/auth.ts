@@ -1,3 +1,4 @@
+import type { TenantPolicy } from '@zeropoint/types';
 import { sha256Hex } from '@zeropoint/crypto';
 import type { Directory } from './directory';
 import { ZeroPointError } from './errors';
@@ -13,6 +14,8 @@ export interface AuthContext {
   /** External end-user id from the x-user-id header. */
   userId: string;
   tenantDefaultBudgetUsd: number;
+  /** Phase 3 governance policy (velocity/circuit-breaker/webhook), read with the key. */
+  tenantPolicy: TenantPolicy;
 }
 
 const unauthorized = () =>
@@ -57,6 +60,7 @@ export async function authenticate(request: Request, directory: Directory): Prom
     apiKeyId: key.apiKeyId,
     userId,
     tenantDefaultBudgetUsd: key.defaultBudgetUsd,
+    tenantPolicy: key.policy,
   };
 }
 

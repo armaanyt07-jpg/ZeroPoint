@@ -1,4 +1,11 @@
-import type { ApiKeyStatus, EndUserStatus, ProviderId, UsageEvent } from '@zeropoint/types';
+import type {
+  ApiKeyStatus,
+  CircuitBreakerEvent,
+  EndUserStatus,
+  ProviderId,
+  TenantPolicy,
+  UsageEvent,
+} from '@zeropoint/types';
 
 /** Rows we need from PostgreSQL (the durable system of record, SRS 4.1). */
 export interface ApiKeyRecord {
@@ -6,6 +13,8 @@ export interface ApiKeyRecord {
   tenantId: string;
   status: ApiKeyStatus;
   defaultBudgetUsd: number;
+  /** Phase 3 governance policy (SRS 4.3 `tenants` columns), read alongside the key. */
+  policy: TenantPolicy;
 }
 
 export interface EndUserRecord {
@@ -21,6 +30,12 @@ export interface TenantStore {
   findEndUser(tenantId: string, externalUserId: string): Promise<EndUserRecord | null>;
   /** Returns the AES-GCM ciphertext string (never plaintext). */
   findProviderCredential(tenantId: string, provider: ProviderId): Promise<string | null>;
+  /**
+   * Governance policy for a tenant, keyed by id alone (settlement has no API key to
+   * join through). Never null for an id that owns at least one settled request: the
+   * tenant row is a foreign key of `end_users`/`api_keys`, so it must already exist.
+   */
+  findTenantPolicy(tenantId: string): Promise<TenantPolicy | null>;
 }
 
 /** The one database write the Worker performs (FR-2.3): durable, idempotent settlement. */
@@ -31,6 +46,16 @@ export interface UsageStore {
    * settled the request, false if it had already been settled.
    */
   settleUsage(event: UsageEvent): Promise<boolean>;
+}
+
+/** FR-3.4's "record the event": an audit trail for the Phase 4 dashboard. */
+export interface CircuitBreakerStore {
+  /**
+   * Best-effort (docs/PHASE_3.md D4): a write failure here is logged, never retried,
+   * and never fails the request/settlement message. It is an audit trail, not
+   * financial accounting, so it doesn't get `settleUsage`'s durability guarantees.
+   */
+  recordCircuitBreakerEvent(event: CircuitBreakerEvent): Promise<void>;
 }
 
 export class StoreError extends Error {
@@ -59,12 +84,25 @@ function num(row: Row, field: string): number {
   return n;
 }
 
+/** Columns needed from `tenants` for the Phase 3 policy, shared by both call sites below. */
+const TENANT_POLICY_COLUMNS = 'velocity_limit_usd,velocity_window_seconds,circuit_breaker_duration_seconds,webhook_url';
+
+function parseTenantPolicy(row: Row): TenantPolicy {
+  const webhookUrl = row['webhook_url'];
+  return {
+    velocityLimitUsd: num(row, 'velocity_limit_usd'),
+    velocityWindowSeconds: num(row, 'velocity_window_seconds'),
+    circuitBreakerDurationSeconds: num(row, 'circuit_breaker_duration_seconds'),
+    webhookUrl: webhookUrl === null ? null : str(row, 'webhook_url'),
+  };
+}
+
 /**
  * Supabase PostgREST client. PostgREST turns each table into a REST endpoint,
  * which works from a Worker without a database driver. The service-role key
  * bypasses Row Level Security, so it must stay a Worker secret (see migration 003).
  */
-export class SupabaseStore implements TenantStore, UsageStore {
+export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerStore {
   constructor(
     private readonly baseUrl: string,
     private readonly serviceRoleKey: string,
@@ -75,7 +113,7 @@ export class SupabaseStore implements TenantStore, UsageStore {
 
   async findApiKeyByHash(keyHash: string): Promise<ApiKeyRecord | null> {
     const row = await this.selectOne('api_keys', {
-      select: 'id,tenant_id,status,tenants(default_budget_usd)',
+      select: `id,tenant_id,status,tenants(default_budget_usd,${TENANT_POLICY_COLUMNS})`,
       key_hash: `eq.${keyHash}`,
     });
     if (!row) return null;
@@ -88,7 +126,43 @@ export class SupabaseStore implements TenantStore, UsageStore {
       tenantId: str(row, 'tenant_id'),
       status,
       defaultBudgetUsd: num(tenant, 'default_budget_usd'),
+      policy: parseTenantPolicy(tenant),
     };
+  }
+
+  async findTenantPolicy(tenantId: string): Promise<TenantPolicy | null> {
+    const row = await this.selectOne('tenants', {
+      select: TENANT_POLICY_COLUMNS,
+      id: `eq.${tenantId}`,
+    });
+    return row ? parseTenantPolicy(row) : null;
+  }
+
+  /** Best-effort insert (CircuitBreakerStore); the caller decides how to handle a failure. */
+  async recordCircuitBreakerEvent(event: CircuitBreakerEvent): Promise<void> {
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/rest/v1/circuit_breaker_events`, {
+        method: 'POST',
+        headers: {
+          apikey: this.serviceRoleKey,
+          authorization: `Bearer ${this.serviceRoleKey}`,
+          'content-type': 'application/json',
+          prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          tenant_id: event.tenantId,
+          external_user_id: event.externalUserId,
+          reason: event.reason,
+          opened_at: event.openedAt,
+          expires_at: event.expiresAt,
+        }),
+        signal: AbortSignal.timeout(this.writeTimeoutMs),
+      });
+    } catch {
+      throw new StoreError('Database request failed or timed out.');
+    }
+    if (!response.ok) throw new StoreError(`Database returned HTTP ${response.status}.`);
   }
 
   async findEndUser(tenantId: string, externalUserId: string): Promise<EndUserRecord | null> {

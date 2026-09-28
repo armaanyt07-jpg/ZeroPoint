@@ -1,6 +1,6 @@
 import { encryptSecret, generateEncryptionKey, sha256Hex } from '@zeropoint/crypto';
 import { createDefaultRegistry } from '@zeropoint/providers';
-import type { UsageEvent } from '@zeropoint/types';
+import type { CircuitBreakerEvent, TenantPolicy, UsageEvent, WebhookEvent } from '@zeropoint/types';
 import { vi } from 'vitest';
 import { runLuaScript } from './lua-redis';
 import { Directory } from '../apps/worker/src/directory';
@@ -10,6 +10,7 @@ import { RedisError } from '../apps/worker/src/redis';
 import {
   StoreError,
   type ApiKeyRecord,
+  type CircuitBreakerStore,
   type EndUserRecord,
   type TenantStore,
 } from '../apps/worker/src/store';
@@ -17,6 +18,15 @@ import type { MetricName, Telemetry } from '../apps/worker/src/telemetry';
 import type { UsageQueue } from '../apps/worker/src/usage-queue';
 import type { UsageStore } from '../apps/worker/src/store';
 import type { SettlementDeps } from '../apps/worker/src/settlement';
+import type { WebhookQueue } from '../apps/worker/src/webhook-queue';
+
+/** The SRS 4.3 tenant defaults ($2/60s, 15-minute circuit, no webhook configured). */
+export const DEFAULT_TENANT_POLICY: TenantPolicy = {
+  velocityLimitUsd: 2,
+  velocityWindowSeconds: 60,
+  circuitBreakerDurationSeconds: 900,
+  webhookUrl: null,
+};
 
 export class FakeRedis implements RedisClient {
   data = new Map<string, string>();
@@ -63,14 +73,16 @@ export class FakeRedis implements RedisClient {
   }
 }
 
-export class FakeStore implements TenantStore {
+export class FakeStore implements TenantStore, CircuitBreakerStore {
   apiKeys = new Map<string, ApiKeyRecord>();
   endUsers = new Map<string, EndUserRecord>();
   credentials = new Map<string, string>();
+  policies = new Map<string, TenantPolicy>();
+  circuitBreakerEvents: CircuitBreakerEvent[] = [];
   failing = false;
   /** Fail only the credential table, to test error precedence. */
   failCredentials = false;
-  calls = { apiKey: 0, endUser: 0, credential: 0 };
+  calls = { apiKey: 0, endUser: 0, credential: 0, policy: 0 };
 
   private check() {
     if (this.failing) throw new StoreError('db down');
@@ -91,6 +103,30 @@ export class FakeStore implements TenantStore {
     if (this.failCredentials) throw new StoreError('credentials table down');
     return this.credentials.get(`${tenantId}:${provider}`) ?? null;
   }
+  async findTenantPolicy(tenantId: string) {
+    this.calls.policy++;
+    this.check();
+    return this.policies.get(tenantId) ?? DEFAULT_TENANT_POLICY;
+  }
+  async recordCircuitBreakerEvent(event: CircuitBreakerEvent) {
+    this.check();
+    this.circuitBreakerEvents.push(event);
+  }
+}
+
+/** In-memory WebhookQueue. `failures` = how many upcoming sends throw. */
+export class FakeWebhookQueue implements WebhookQueue {
+  sent: WebhookEvent[] = [];
+  failures = 0;
+  attempts = 0;
+  async send(event: WebhookEvent) {
+    this.attempts++;
+    if (this.failures > 0) {
+      this.failures--;
+      throw new Error('queue down');
+    }
+    this.sent.push(event);
+  }
 }
 
 /** In-memory UsageQueue. `failures` = how many upcoming sends throw. */
@@ -109,9 +145,11 @@ export class FakeUsageQueue implements UsageQueue {
 }
 
 /** In-memory settle_usage: idempotent by request id, like the SQL function. */
-export class FakeUsageStore implements UsageStore {
+export class FakeUsageStore implements UsageStore, CircuitBreakerStore, Pick<TenantStore, 'findTenantPolicy'> {
   logs = new Map<string, UsageEvent>();
   spend = new Map<string, number>();
+  policies = new Map<string, TenantPolicy>();
+  circuitBreakerEvents: CircuitBreakerEvent[] = [];
   failures = 0;
   calls = 0;
   async settleUsage(event: UsageEvent) {
@@ -125,6 +163,12 @@ export class FakeUsageStore implements UsageStore {
     const key = `${event.tenantId}:${event.externalUserId}`;
     this.spend.set(key, (this.spend.get(key) ?? 0) + event.estimatedCostUsd);
     return true;
+  }
+  async findTenantPolicy(tenantId: string): Promise<TenantPolicy | null> {
+    return this.policies.get(tenantId) ?? DEFAULT_TENANT_POLICY;
+  }
+  async recordCircuitBreakerEvent(event: CircuitBreakerEvent) {
+    this.circuitBreakerEvents.push(event);
   }
 }
 
@@ -161,6 +205,7 @@ export interface Harness {
   telemetry: FakeTelemetry;
   providerFetch: ReturnType<typeof vi.fn>;
   queue: FakeUsageQueue;
+  webhookQueue: FakeWebhookQueue;
   usageStore: FakeUsageStore;
   deps: Dependencies;
   encryptionKey: string;
@@ -182,6 +227,7 @@ export async function createHarness(): Promise<Harness> {
     tenantId: TENANT_ID,
     status: 'active',
     defaultBudgetUsd: 20,
+    policy: DEFAULT_TENANT_POLICY,
   });
   store.credentials.set(
     `${TENANT_ID}:openai`,
@@ -195,6 +241,7 @@ export async function createHarness(): Promise<Harness> {
 
   const deferred: Promise<unknown>[] = [];
   const queue = new FakeUsageQueue();
+  const webhookQueue = new FakeWebhookQueue();
   const usageStore = new FakeUsageStore();
   const defer = (work: Promise<unknown>) => void deferred.push(work);
   const deps: Dependencies = {
@@ -205,12 +252,26 @@ export async function createHarness(): Promise<Harness> {
     encryptionKey,
     fetch: providerFetch as unknown as typeof fetch,
     usageQueue: queue,
+    webhookQueue,
+    circuitBreakerStore: store,
     defer,
   };
   const flush = async () => {
     await Promise.all(deferred.splice(0));
   };
-  return { redis, store, telemetry, providerFetch, queue, usageStore, deps, encryptionKey, deferred, flush };
+  return {
+    redis,
+    store,
+    telemetry,
+    providerFetch,
+    queue,
+    webhookQueue,
+    usageStore,
+    deps,
+    encryptionKey,
+    deferred,
+    flush,
+  };
 }
 
 export function proxyRequest(
@@ -249,7 +310,7 @@ export async function addCredential(h: Harness, provider: string, plaintext: str
 
 /** What the queue consumer needs, wired to the harness's fakes. */
 export function settlementDeps(h: Harness): SettlementDeps {
-  return { redis: h.redis, store: h.usageStore, telemetry: h.telemetry };
+  return { redis: h.redis, store: h.usageStore, telemetry: h.telemetry, webhookQueue: h.webhookQueue };
 }
 
 /** A queue message wrapper that records ack/retry, like Cloudflare's Message. */

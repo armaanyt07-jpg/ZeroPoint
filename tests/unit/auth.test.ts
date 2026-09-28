@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { assertUserAllowed, authenticate, extractBearerToken, extractUserId } from '../../apps/worker/src/auth';
 import { ZeroPointError } from '../../apps/worker/src/errors';
-import { PROXY_KEY, TENANT_ID, USER_ID, createHarness, proxyRequest } from '../helpers';
+import { DEFAULT_TENANT_POLICY, PROXY_KEY, TENANT_ID, USER_ID, createHarness, proxyRequest } from '../helpers';
 import { sha256Hex } from '@zeropoint/crypto';
 
 describe('header parsing', () => {
@@ -27,6 +27,7 @@ describe('authenticate (FR-1.1)', () => {
     const h = await createHarness();
     expect(await authenticate(proxyRequest(), h.deps.directory)).toEqual({
       tenantId: TENANT_ID, apiKeyId: 'key-1', userId: USER_ID, tenantDefaultBudgetUsd: 20,
+      tenantPolicy: DEFAULT_TENANT_POLICY,
     });
   });
 
@@ -51,7 +52,13 @@ describe('authenticate (FR-1.1)', () => {
   it('401: unknown key', () => expect401(proxyRequest({ headers: { authorization: 'Bearer pk_live_unknown' } })));
   it('401: revoked key', () =>
     expect401(proxyRequest(), async (h) => {
-      h.store.apiKeys.set(await sha256Hex(PROXY_KEY), { apiKeyId: 'k', tenantId: TENANT_ID, status: 'revoked', defaultBudgetUsd: 20 });
+      h.store.apiKeys.set(await sha256Hex(PROXY_KEY), {
+        apiKeyId: 'k',
+        tenantId: TENANT_ID,
+        status: 'revoked',
+        defaultBudgetUsd: 20,
+        policy: DEFAULT_TENANT_POLICY,
+      });
     }));
   it('401: missing x-user-id', () => expect401(proxyRequest({ headers: { 'x-user-id': null } })));
 

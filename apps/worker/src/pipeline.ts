@@ -8,8 +8,8 @@ import { forwardToProvider } from './proxy';
 import type { Telemetry } from './telemetry';
 
 /**
- * The Phase 1 request lifecycle (SRS sections 2.1 and 7, minus the circuit
- * breaker which arrives in Phase 3):
+ * The request lifecycle (SRS sections 2.1 and 7, minus the circuit breaker which
+ * arrives in Phase 3):
  *
  *   authenticate -> pick provider -> [user + spend + provider key, in parallel]
  *   -> user status -> budget -> (await key) decrypt -> forward
@@ -24,6 +24,9 @@ export async function handleProxyRequest(
   requestId?: string,
 ): Promise<Response> {
   const { telemetry } = deps;
+  const startedAt = Date.now();
+  // Also the settlement idempotency key (FR-2.4), so it must be a UUID.
+  const id = requestId ?? crypto.randomUUID();
   telemetry.increment('requests_total');
   try {
     // 1. FR-1.1: who is calling? (401)
@@ -64,7 +67,14 @@ export async function handleProxyRequest(
       auth.tenantId,
       adapter.id,
     );
-    const response = await forwardToProvider(adapter, request, providerKey, deps.fetch, telemetry);
+    const response = await forwardToProvider(adapter, request, providerKey, deps.fetch, telemetry, {
+      requestId: id,
+      tenantId: auth.tenantId,
+      externalUserId: auth.userId,
+      startedAt,
+      queue: deps.usageQueue,
+      defer: deps.defer,
+    });
     telemetry.increment('requests_allowed', { provider: adapter.id });
     return response;
   } catch (error) {

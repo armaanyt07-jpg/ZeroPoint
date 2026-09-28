@@ -9,6 +9,8 @@
 export interface RedisClient {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
+  /** Runs a Lua script atomically (Redis EVAL). Used for settlement (FR-2.3/2.4). */
+  eval(script: string, keys: string[], args: (string | number)[]): Promise<unknown>;
 }
 
 export class RedisError extends Error {
@@ -40,6 +42,10 @@ export class UpstashRedis implements RedisClient {
     await this.command(
       ttlSeconds === undefined ? ['SET', key, value] : ['SET', key, value, 'EX', ttlSeconds],
     );
+  }
+
+  async eval(script: string, keys: string[], args: (string | number)[]): Promise<unknown> {
+    return this.command(['EVAL', script, keys.length, ...keys, ...args]);
   }
 
   private async command(args: (string | number)[]): Promise<unknown> {

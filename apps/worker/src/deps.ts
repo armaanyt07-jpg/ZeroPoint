@@ -2,8 +2,10 @@ import { UpstashRedis, type RedisClient } from './redis';
 import { Directory } from './directory';
 import { ZeroPointError } from './errors';
 import { SupabaseStore } from './store';
+import type { SettlementDeps } from './settlement';
 import type { Telemetry } from './telemetry';
 import type { Env } from './env';
+import type { UsageQueue } from './usage-queue';
 import { createDefaultRegistry, type ProviderRegistry } from '@zeropoint/providers';
 
 /** Everything the request pipeline needs. Tests build this with fakes. */
@@ -14,6 +16,10 @@ export interface Dependencies {
   providers: ProviderRegistry;
   encryptionKey: string;
   fetch: typeof fetch;
+  /** Where usage events go for asynchronous settlement (FR-2.3). */
+  usageQueue: UsageQueue;
+  /** Runs work after the response is returned (`ctx.waitUntil`). */
+  defer: (work: Promise<unknown>) => void;
 }
 
 const REQUIRED: (keyof Env)[] = [
@@ -22,6 +28,7 @@ const REQUIRED: (keyof Env)[] = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
   'CREDENTIAL_ENCRYPTION_KEY',
+  'USAGE_QUEUE',
 ];
 
 /** Wires real infrastructure clients from Worker secrets/bindings. */
@@ -38,12 +45,40 @@ export function createDependencies(
   }
   const redis = new UpstashRedis(env.UPSTASH_REDIS_REST_URL, env.UPSTASH_REDIS_REST_TOKEN);
   const store = new SupabaseStore(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
+  const defer = (work: Promise<unknown>) => ctx.waitUntil(work);
   return {
     redis,
-    directory: new Directory(redis, store, telemetry, (work) => ctx.waitUntil(work)),
+    directory: new Directory(redis, store, telemetry, defer),
     telemetry,
     providers: createDefaultRegistry(),
     encryptionKey: env.CREDENTIAL_ENCRYPTION_KEY,
     fetch: (input, init) => fetch(input, init),
+    usageQueue: {
+      send: async (event) => {
+        await env.USAGE_QUEUE.send(event);
+      },
+    },
+    defer,
+  };
+}
+
+/** Wires the queue consumer's clients. Settlement is not latency-sensitive, so the timeouts are generous. */
+export function createSettlementDependencies(env: Env, telemetry: Telemetry): SettlementDeps {
+  const missing = (['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'] as const).filter(
+    (name) => !env[name],
+  );
+  if (missing.length > 0) {
+    console.error(JSON.stringify({ type: 'config_error', missing }));
+    throw new ZeroPointError(500, 'CONFIGURATION_ERROR', 'The service is not configured correctly.');
+  }
+  return {
+    redis: new UpstashRedis(
+      env.UPSTASH_REDIS_REST_URL,
+      env.UPSTASH_REDIS_REST_TOKEN,
+      (input, init) => fetch(input, init),
+      5000,
+    ),
+    store: new SupabaseStore(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY),
+    telemetry,
   };
 }

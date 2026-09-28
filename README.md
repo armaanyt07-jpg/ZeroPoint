@@ -1,8 +1,8 @@
 # ZeroPoint
 
-Edge AI Gateway & Cost Governance Proxy. See `docs/ZeroPoint_SRS_v1.0.pdf` (source of truth) and `docs/PHASE_1.md`.
+Edge AI Gateway & Cost Governance Proxy. See `docs/ZeroPoint_SRS_v1.0.pdf` (source of truth), `docs/PHASE_1.md` and `docs/PHASE_2.md`.
 
-**Status: Phase 1** - authenticated edge proxy with pre-flight budget guardrails (OpenAI, Anthropic, Gemini).
+**Status: Phase 2** - authenticated edge proxy with pre-flight budget guardrails (OpenAI, Anthropic, Gemini), plus `tee()` stream inspection and asynchronous, idempotent usage settlement through Cloudflare Queues into Redis and PostgreSQL. Spend only accumulates once model prices are configured (`packages/pricing`; the SRS lists none).
 
 ## Requirements
 Node 20+ and pnpm.
@@ -17,8 +17,8 @@ pnpm dev            # wrangler dev (needs apps/worker/.dev.vars)
 ```
 
 ## Running locally
-1. Create a Supabase project and apply `database/migrations/*.sql` in order.
-2. Create an Upstash Redis database.
+1. Create a Supabase project and apply `database/migrations/*.sql` in order (001-005).
+2. Create an Upstash Redis database, and the queues: `wrangler queues create zeropoint-usage` and `wrangler queues create zeropoint-usage-dlq`.
 3. `cp apps/worker/.dev.vars.example apps/worker/.dev.vars` and fill it in (git-ignored).
 4. Seed a tenant, then use `pnpm helper` to make a proxy key hash (`generate-proxy-key`) and an encrypted provider key (`encrypt-credential`), and insert them into `api_keys` / `tenant_provider_credentials`.
 5. `pnpm dev`, then:

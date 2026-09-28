@@ -89,3 +89,88 @@ describe('non-negative budget constraints (migration 004)', () => {
     await expect(db.query(`UPDATE end_users SET budget_limit_usd = -1 WHERE external_user_id='u'`)).rejects.toThrow(/check/i);
   });
 });
+
+describe('settlement (migration 005, FR-2.3 / FR-2.4)', () => {
+  const REQ = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const settle = (tenant: string, request: string, user = 'u1', cost = 0.00003, extra: { model?: string | null; streaming?: boolean } = {}) =>
+    one(
+      `SELECT settle_usage($1,$2,$3,'openai',$4,200,100,50,150,$5,'provider_reported',120,$6,'2026-09-26T10:00:00Z') AS settled`,
+      [request, tenant, user, extra.model === undefined ? 'gpt-x' : extra.model, cost, extra.streaming ?? true],
+    );
+  const spendOf = async (tenant: string, user = 'u1') =>
+    Number((await one(`SELECT current_spend_usd FROM end_users WHERE tenant_id=$1 AND external_user_id=$2`, [tenant, user]))['current_spend_usd']);
+
+  it('widens current_spend_usd to NUMERIC(14,8) so tiny costs are not rounded away', async () => {
+    const col = await one(`SELECT numeric_precision p, numeric_scale s FROM information_schema.columns WHERE table_name='end_users' AND column_name='current_spend_usd'`);
+    expect([col['p'], col['s']]).toEqual([14, 8]);
+    const tenant = await newTenant();
+    for (let i = 0; i < 100; i++) await settle(tenant, REQ(1000 + i), 'tiny', 0.00003);
+    expect(await spendOf(tenant, 'tiny')).toBeCloseTo(0.003, 10); // 100 x $0.00003; a 4-decimal column would give $0.0000-0.0100 noise
+  });
+
+  it('creates the end user and the request log, and adds the cost once', async () => {
+    const tenant = await newTenant();
+    expect((await settle(tenant, REQ(1)))['settled']).toBe(true);
+    expect(await spendOf(tenant)).toBeCloseTo(0.00003, 10);
+    const log = await one(`SELECT * FROM request_logs WHERE request_id=$1`, [REQ(1)]);
+    expect(log).toMatchObject({ provider: 'openai', model: 'gpt-x', status_code: 200, usage_source: 'provider_reported', latency_ms: 120, streaming: true, circuit_breaker_triggered: false });
+    expect([Number(log['input_tokens']), Number(log['output_tokens']), Number(log['total_tokens'])]).toEqual([100, 50, 150]);
+    expect(Number(log['estimated_cost_usd'])).toBeCloseTo(0.00003, 10);
+    expect(new Date(log['created_at'] as string).toISOString()).toBe('2026-09-26T10:00:00.000Z');
+    const user = await one(`SELECT id FROM end_users WHERE tenant_id=$1 AND external_user_id='u1'`, [tenant]);
+    expect(log['end_user_id']).toBe(user['id']);
+  });
+
+  it('is idempotent: the same request_id settles once and returns false afterwards (FR-2.4)', async () => {
+    const tenant = await newTenant();
+    expect((await settle(tenant, REQ(2), 'u1', 1))['settled']).toBe(true);
+    expect((await settle(tenant, REQ(2), 'u1', 1))['settled']).toBe(false);
+    expect((await settle(tenant, REQ(2), 'u1', 1))['settled']).toBe(false);
+    expect(await spendOf(tenant)).toBe(1);
+    expect(Number((await one(`SELECT count(*) c FROM request_logs WHERE request_id=$1`, [REQ(2)]))['c'])).toBe(1);
+  });
+
+  it('is idempotent under concurrent redelivery of the same request_id', async () => {
+    const tenant = await newTenant();
+    const results = await Promise.all(Array.from({ length: 8 }, () => settle(tenant, REQ(3), 'u1', 2)));
+    expect(results.filter((r) => r['settled'] === true)).toHaveLength(1);
+    expect(await spendOf(tenant)).toBe(2);
+  });
+
+  it('accumulates different requests and keeps tenants and users separate', async () => {
+    const a = await newTenant();
+    const b = await newTenant();
+    await settle(a, REQ(10), 'u1', 1);
+    await settle(a, REQ(11), 'u1', 2);
+    await settle(a, REQ(12), 'u2', 4);
+    await settle(b, REQ(13), 'u1', 8);
+    expect([await spendOf(a, 'u1'), await spendOf(a, 'u2'), await spendOf(b, 'u1')]).toEqual([3, 4, 8]);
+  });
+
+  it('keeps an existing end user (budget, status) and adds to their spend', async () => {
+    const tenant = await newTenant();
+    await db.query(`INSERT INTO end_users (tenant_id, external_user_id, budget_limit_usd, status, current_spend_usd) VALUES ($1,'vip',7.5,'suspended',1)`, [tenant]);
+    await settle(tenant, REQ(20), 'vip', 0.5);
+    const user = await one(`SELECT budget_limit_usd b, status s, current_spend_usd c FROM end_users WHERE tenant_id=$1 AND external_user_id='vip'`, [tenant]);
+    expect([Number(user['b']), user['s'], Number(user['c'])]).toEqual([7.5, 'suspended', 1.5]);
+  });
+
+  it('accepts a null model and an unknown-usage zero-cost row', async () => {
+    const tenant = await newTenant();
+    await db.query(`SELECT settle_usage($1,$2,'u',$3,NULL,200,0,0,0,0,'unknown',5,FALSE,NULL)`, [REQ(30), tenant, 'openai']);
+    const log = await one(`SELECT model, usage_source, streaming, created_at FROM request_logs WHERE request_id=$1`, [REQ(30)]);
+    expect(log).toMatchObject({ model: null, usage_source: 'unknown', streaming: false });
+    expect(log['created_at']).toBeTruthy();
+  });
+
+  it('rejects an invalid usage_source (the SRS CHECK still applies) and leaves spend untouched', async () => {
+    const tenant = await newTenant();
+    await expect(db.query(`SELECT settle_usage($1,$2,'u','openai','m',200,1,1,2,9,'guess',1,FALSE,NULL)`, [REQ(31), tenant])).rejects.toThrow(/check/i);
+    expect(Number((await one(`SELECT count(*) c FROM request_logs WHERE request_id=$1`, [REQ(31)]))['c'])).toBe(0);
+  });
+
+  it('is not executable by PUBLIC (RLS does not protect functions; only service_role may call it)', async () => {
+    const { rows } = await db.query(`SELECT has_function_privilege('public', 'settle_usage(uuid,uuid,text,text,text,integer,bigint,bigint,bigint,numeric,text,integer,boolean,timestamptz)', 'EXECUTE') AS ok`);
+    expect((rows[0] as { ok: boolean }).ok).toBe(false);
+  });
+});

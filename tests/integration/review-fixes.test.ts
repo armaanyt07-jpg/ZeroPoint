@@ -261,6 +261,7 @@ describe('Major 3: ExecutionContext and non-blocking cache writes', () => {
         SUPABASE_URL: 'https://db.test',
         SUPABASE_SERVICE_ROLE_KEY: 's',
         CREDENTIAL_ENCRYPTION_KEY: encryptionKey,
+        USAGE_QUEUE: { send: async () => {} } as never,
       };
       const res = await worker.fetch(proxyRequest(), env, { waitUntil } as unknown as ExecutionContext);
       expect(res.status).toBe(200);

@@ -1,6 +1,7 @@
 import type { LLMProviderAdapter } from '@zeropoint/providers';
 import { ZeroPointError } from './errors';
 import type { Telemetry } from './telemetry';
+import { trackUsage, type UsageContext } from './streaming/usage-extractor';
 
 /**
  * Only these upstream response headers reach the client. An allow-list keeps
@@ -15,7 +16,9 @@ const MAX_ERROR_MESSAGE_LENGTH = 300;
  * Sends the adapter-built request upstream and returns a client-safe response.
  *
  * Success responses stream through: `response.body` is piped to the client
- * without being read into memory (SRS 2.3: no full buffering). Every error
+ * without being read into memory (SRS 2.3: no full buffering). When a `usage`
+ * context is given, the body is first duplicated with `tee()` (FR-2.1): Stream A
+ * is the client's response, Stream B feeds usage tracking in the background. Every error
  * becomes ZeroPoint's own `{ error: { code, message } }` shape (SRS sections 6
  * and 8), so clients parse one format and never see raw provider payloads.
  */
@@ -25,6 +28,7 @@ export async function forwardToProvider(
   providerApiKey: string,
   fetchImpl: typeof fetch,
   telemetry: Telemetry,
+  usage?: UsageContext,
 ): Promise<Response> {
   const upstreamRequest = await adapter.buildProviderRequest(clientRequest, providerApiKey);
 
@@ -36,19 +40,44 @@ export async function forwardToProvider(
     throw new ZeroPointError(502, 'PROVIDER_UNREACHABLE', 'Could not reach the LLM provider.');
   }
 
-  if (upstream.ok) return passThrough(upstream);
+  if (upstream.ok) return passThrough(upstream, adapter, clientRequest, telemetry, usage);
 
   telemetry.increment('provider_errors', { provider: adapter.id, status: String(upstream.status) });
   throw await normalizeProviderError(upstream, providerApiKey);
 }
 
-function passThrough(upstream: Response): Response {
+function passThrough(
+  upstream: Response,
+  adapter: LLMProviderAdapter,
+  clientRequest: Request,
+  telemetry: Telemetry,
+  usage?: UsageContext,
+): Response {
   const headers = new Headers();
   for (const name of RESPONSE_HEADER_ALLOW_LIST) {
     const value = upstream.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  return new Response(upstream.body, { status: upstream.status, headers });
+  if (!usage) return new Response(upstream.body, { status: upstream.status, headers });
+
+  // FR-2.1: Stream A -> client, Stream B -> usage tracking. `tee()` never reads the
+  // body itself: chunks flow as the two consumers pull them, so nothing is fully buffered.
+  const [clientStream, analyticsStream] = upstream.body ? upstream.body.tee() : [null, null];
+  usage.defer(
+    trackUsage(
+      analyticsStream,
+      adapter,
+      usage,
+      {
+        provider: adapter.id,
+        statusCode: upstream.status,
+        contentType: upstream.headers.get('content-type') ?? '',
+        pathname: new URL(clientRequest.url).pathname,
+      },
+      telemetry,
+    ),
+  );
+  return new Response(clientStream, { status: upstream.status, headers });
 }
 
 async function normalizeProviderError(upstream: Response, providerApiKey: string): Promise<ZeroPointError> {

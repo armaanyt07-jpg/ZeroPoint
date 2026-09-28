@@ -1,7 +1,8 @@
 import { calculateCostUsd, findPricing } from '@zeropoint/pricing';
-import type { ModelPricing, ProviderUsage } from '@zeropoint/types';
+import type { ModelPricing, PartialUsage, ProviderUsage } from '@zeropoint/types';
 import type { LLMProviderAdapter } from './adapter';
 import { copyAllowedHeaders, isPostWithBearer, streamingPost } from './shared';
+import { asRecord, mergeUsage, parseChunkOnce, stringOrUndefined, tokenCount } from './usage';
 
 const UPSTREAM_ORIGIN = 'https://generativelanguage.googleapis.com';
 
@@ -42,9 +43,40 @@ export class GeminiAdapter implements LLMProviderAdapter {
     return streamingPost(url.toString(), headers, request.body);
   }
 
-  /** PHASE 2 STUB: SSE usage extraction is implemented with dual-stream parsing (FR-2.2). */
-  parseStreamChunk(_chunk: Uint8Array): ProviderUsage | null {
-    return null;
+  parseStreamChunk(chunk: Uint8Array): ProviderUsage | null {
+    return parseChunkOnce(this, chunk);
+  }
+
+  /**
+   * `usageMetadata` (cumulative) is on the response object and, when streaming
+   * with `?alt=sse`, on the streamed chunks. Output = `candidatesTokenCount` +
+   * `thoughtsTokenCount` (thinking tokens are billed as output). Streaming
+   * WITHOUT `alt=sse` returns a JSON array of such objects, so arrays are merged.
+   */
+  extractUsage(payload: unknown): PartialUsage | null {
+    if (Array.isArray(payload)) {
+      const merged: PartialUsage = {};
+      for (const item of payload as unknown[]) mergeUsage(merged, this.extractUsage(item));
+      return Object.keys(merged).length > 0 ? merged : null;
+    }
+    const body = asRecord(payload);
+    if (!body) return null;
+    const result: PartialUsage = {};
+    const model = stringOrUndefined(body['modelVersion']);
+    if (model !== undefined) result.model = model;
+    const meta = asRecord(body['usageMetadata']);
+    const input = tokenCount(meta?.['promptTokenCount']);
+    if (input !== undefined) {
+      result.inputTokens = input;
+      result.outputTokens =
+        (tokenCount(meta?.['candidatesTokenCount']) ?? 0) + (tokenCount(meta?.['thoughtsTokenCount']) ?? 0);
+    }
+    return Object.keys(result).length > 0 ? result : null;
+  }
+
+  /** `/v1beta/models/gemini-2.0-flash:generateContent` -> `gemini-2.0-flash`. */
+  modelFromPath(pathname: string): string | null {
+    return /^\/(?:v1|v1beta)\/models\/([A-Za-z0-9._-]+):/.exec(pathname)?.[1] ?? null;
   }
 
   calculateCost(usage: ProviderUsage): number {

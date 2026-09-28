@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ZeroPoint - Edge AI Gateway & Cost Governance Proxy (Phase 1)",
+  "description": "ZeroPoint - Edge AI Gateway & Cost Governance Proxy (Phase 2)",
   "packageManager": "pnpm@12.6.0",
   "engines": {
     "node": ">=20"
@@ -23,6 +23,7 @@
     "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^26.6.2",
     "eslint": "^10.11.0",
+    "fengari": "^0.1.5",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.70.1",

@@ -4,8 +4,8 @@ import type { ModelPricing, ProviderUsage } from '@zeropoint/types';
  * Cost formula from SRS section 9:
  *   total = input_tokens * input_price + output_tokens * output_price
  *
- * Phase 1 only ships the formula. The actual price tables and the code that
- * feeds it token counts from streamed responses arrive in Phase 2.
+ * Rounded to 8 decimals, the precision of `request_logs.estimated_cost_usd`, so
+ * floating-point noise never reaches the ledger.
  */
 export function calculateCostUsd(
   usage: Pick<ProviderUsage, 'inputTokens' | 'outputTokens'>,
@@ -22,7 +22,7 @@ export function calculateCostUsd(
   }
   const inputCost = (usage.inputTokens * pricing.inputPerMillionTokens) / 1_000_000;
   const outputCost = (usage.outputTokens * pricing.outputPerMillionTokens) / 1_000_000;
-  return inputCost + outputCost;
+  return Math.round((inputCost + outputCost) * 1e8) / 1e8;
 }
 
 export function findPricing(
@@ -32,3 +32,17 @@ export function findPricing(
 ): ModelPricing | undefined {
   return table.find((p) => p.provider === provider && p.model === model);
 }
+
+/**
+ * Version of the price table (SRS section 18: "versioned pricing configuration").
+ * Bump it whenever DEFAULT_PRICING changes.
+ */
+export const PRICING_VERSION = '1';
+
+/**
+ * DELIBERATELY EMPTY. The SRS defines the price model (section 9) but specifies
+ * no per-model prices, and prices must not be invented. Until an operator adds
+ * entries, every model is "unpriced": requests are still logged with their token
+ * counts, but cost is 0 and `usage_source` is 'unknown' (docs/PHASE_2.md, D3).
+ */
+export const DEFAULT_PRICING: readonly ModelPricing[] = [];

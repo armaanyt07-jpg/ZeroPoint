@@ -158,3 +158,59 @@ Fixes for the Critical and Major findings in `docs/PHASE_1_REVIEW.md`: request a
 
 ### How To Verify
 `pnpm check`, then `curl -i localhost:8787/health` and look for `x-request-id` on any proxy response.
+
+## Step 8 - Phase 2 plan
+### What Changed
+`docs/PHASE_2_PLAN.md`: the SRS Phase 2 requirements mapped to files, data flow, risks and deferred work, with decisions D1-D6 resolved.
+### Why
+Phase 2 touches the request path, Redis, a queue and two schema changes; the scope and the boundary with Phases 3/4 were fixed before any code changed.
+### Files Changed
+`docs/PHASE_2_PLAN.md`.
+### How To Verify
+Read it against `docs/ZeroPoint_SRS_v1.0.pdf` sections 3 (Phase 2), 8-11, 17.
+
+## Step 9 - Dual-stream parsing (FR-2.1, FR-2.2)
+### What Changed
+`tee()` on successful provider responses, an incremental SSE decoder, per-provider usage extraction, cost calculation, a price table (empty on purpose), and the OpenAI streaming usage opt-in.
+### Why
+The client must get the stream with no added buffering while ZeroPoint reads token usage on the side (SRS 2.3, NFR-5.1).
+### How It Works
+- `proxy.ts` `passThrough()`: when a usage context is supplied, `upstream.body.tee()`; branch A is the client `Response`, branch B goes to `trackUsage` under `ctx.waitUntil`.
+- `SseParser` (`packages/providers/src/sse-parser.ts`): `TextDecoder({stream:true})`, `\n`/`\r\n`/`\r`, multi-line `data:`, comments, an unterminated final frame delivered by `end()`, bounded buffer.
+- Adapters implement `extractUsage(json)`; `mergeUsage` keeps the latest cumulative value per field; frames without `"usage` skip `JSON.parse`.
+- JSON (non-streaming) bodies are buffered up to 2 MiB and parsed once (D1). OpenAI `stream:true` requests get `stream_options.include_usage` (D2).
+- `packages/pricing` gets `DEFAULT_PRICING = []` (the SRS has no price values; unpriced -> cost 0, `usage_source = 'unknown'`) and 8-decimal rounding.
+### Files Changed
+`apps/worker/src/{proxy,pipeline,deps,telemetry}.ts`, `apps/worker/src/streaming/*`, `packages/providers/src/*`, `packages/pricing`, `packages/types`.
+### Important Concepts
+`ReadableStream.tee()`, incremental decoding, cumulative usage (see `docs/PHASE_2.md`).
+### How To Verify
+`pnpm test tests/unit/sse-parser.test.ts tests/unit/usage-extraction.test.ts tests/unit/openai-stream-optin.test.ts tests/integration/streaming.test.ts`
+
+## Step 10 - Queue settlement (FR-2.3, FR-2.4)
+### What Changed
+A Cloudflare Queue producer and consumer, atomic idempotent Redis settlement, an idempotent Postgres function, migration 005, and queue bindings.
+### Why
+Spend must be recorded without adding latency to the user's request, and a redelivered message must never charge twice.
+### How It Works
+- The request path sends a metadata-only `UsageEvent` (3 attempts with backoff, off the client path).
+- The Worker's `queue()` handler runs `settlement.ts`: a Lua `EVAL` (`SET settled:{request_id} NX`, then `INCRBYFLOAT spend:{tenant}:{user}`) and then the `settle_usage()` RPC (upsert user, `INSERT request_logs ... ON CONFLICT DO NOTHING`, add cost only if inserted). Each half is idempotent alone. Failures retry with backoff; after 10 attempts a message goes to the dead-letter queue.
+- Migration 005 widens `end_users.current_spend_usd` to `NUMERIC(14,8)` and restricts `settle_usage` to the service role.
+### Files Changed
+`apps/worker/src/{settlement,usage-queue,redis,store,env,index,deps}.ts`, `apps/worker/wrangler.toml`, `database/migrations/005_settlement.sql`, `database/README.md`.
+### Important Concepts
+At-least-once delivery, idempotency keys, atomic Lua scripts, dead-letter queues, function privileges in Postgres.
+### How To Verify
+`pnpm test tests/unit/settlement.test.ts tests/unit/migrations.test.ts`. Deploy: `wrangler queues create zeropoint-usage` and `zeropoint-usage-dlq`, apply migration 005, then deploy.
+
+## Step 11 - Phase 2 tests and verification
+### What Changed
+131 new tests (318 total), a Lua VM (`fengari`, dev dependency) so the real settlement script is executed in tests, `docs/PHASE_2.md`, README status.
+### Why
+Every new behaviour needed a test that fails when the behaviour breaks; each core behaviour was mutation-checked.
+### How It Works
+See the Tests section of `docs/PHASE_2.md`. A throwaway `wrangler dev` harness confirmed incremental delivery, queue delivery, settlement and disconnect handling in the real Workers runtime.
+### Files Changed
+`tests/**`, `package.json` (`fengari`), `docs/PHASE_2.md`, `docs/CHANGELOG.md`, `README.md`.
+### How To Verify
+`pnpm check` and `pnpm build:check`.

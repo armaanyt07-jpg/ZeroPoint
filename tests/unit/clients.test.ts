@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RedisError, UpstashRedis } from '../../apps/worker/src/redis';
 import { StoreError, SupabaseStore } from '../../apps/worker/src/store';
+import type { UsageEvent } from '@zeropoint/types';
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -111,5 +112,53 @@ describe('SupabaseStore', () => {
       expect(raw).not.toContain('a,b"c&d=e'); // encoded on the wire
       expect(new URL(raw).searchParams.get('external_user_id')).toBe('eq.a,b"c&d=e');
     });
+  });
+});
+
+describe('UpstashRedis.eval (Phase 2)', () => {
+  it('sends EVAL <script> <numkeys> <keys...> <args...> and returns the script result', async () => {
+    const f = vi.fn(async (_i: RequestInfo | URL, _init?: RequestInit) => json({ result: 1 }));
+    const redis = new UpstashRedis('https://r.example', 't', f as unknown as typeof fetch);
+    expect(await redis.eval('return 1', ['k1', 'k2'], ['a', 5])).toBe(1);
+    expect(JSON.parse(f.mock.calls[0]![1]!.body as string)).toEqual(['EVAL', 'return 1', 2, 'k1', 'k2', 'a', 5]);
+  });
+  it('throws RedisError when the script errors', async () => {
+    const redis = new UpstashRedis('https://r', 't', (async () => json({ error: 'ERR script' })) as unknown as typeof fetch);
+    await expect(redis.eval('x', [], [])).rejects.toThrow(RedisError);
+  });
+});
+
+describe('SupabaseStore.settleUsage (Phase 2)', () => {
+  const event: UsageEvent = {
+    requestId: 'r', tenantId: 't', externalUserId: 'u', provider: 'openai', model: 'm', statusCode: 200, inputTokens: 1,
+    outputTokens: 2, totalTokens: 3, estimatedCostUsd: 0.5, usageSource: 'provider_reported', latencyMs: 9, streaming: true,
+    occurredAt: '2026-09-26T10:00:00.000Z',
+  };
+  const store = (f: (url: string, init: RequestInit) => Promise<Response>) =>
+    new SupabaseStore('https://p.supabase.co', 'svc', f as unknown as typeof fetch);
+
+  it('calls the settle_usage RPC with the service-role key and named parameters', async () => {
+    let seen: { url: string; init: RequestInit } | undefined;
+    const s = store(async (url, init) => {
+      seen = { url, init };
+      return json(true);
+    });
+    expect(await s.settleUsage(event)).toBe(true);
+    expect(seen!.url).toBe('https://p.supabase.co/rest/v1/rpc/settle_usage');
+    expect(seen!.init.method).toBe('POST');
+    expect((seen!.init.headers as Record<string, string>)['apikey']).toBe('svc');
+    expect(JSON.parse(seen!.init.body as string)).toEqual({
+      p_request_id: 'r', p_tenant_id: 't', p_external_user_id: 'u', p_provider: 'openai', p_model: 'm', p_status_code: 200,
+      p_input_tokens: 1, p_output_tokens: 2, p_total_tokens: 3, p_estimated_cost_usd: 0.5, p_usage_source: 'provider_reported',
+      p_latency_ms: 9, p_streaming: true, p_created_at: '2026-09-26T10:00:00.000Z',
+    });
+  });
+  it('returns false for an already-settled request', async () => {
+    expect(await store(async () => json(false)).settleUsage(event)).toBe(false);
+  });
+  it('throws StoreError on HTTP errors, network failures and unexpected bodies', async () => {
+    await expect(store(async () => json({}, 500)).settleUsage(event)).rejects.toThrow(StoreError);
+    await expect(store(async () => { throw new Error('x'); }).settleUsage(event)).rejects.toThrow(StoreError);
+    await expect(store(async () => json({ nope: 1 })).settleUsage(event)).rejects.toThrow(StoreError);
   });
 });

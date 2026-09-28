@@ -57,6 +57,7 @@ describe('Minor 1: /health', () => {
     const env = {
       UPSTASH_REDIS_REST_URL: 'https://r.test', UPSTASH_REDIS_REST_TOKEN: 't',
       SUPABASE_URL: 'https://d.test', SUPABASE_SERVICE_ROLE_KEY: 's', CREDENTIAL_ENCRYPTION_KEY: 'k',
+      USAGE_QUEUE: { send: async () => {} } as never,
     };
     expect((await worker.fetch(health(), env, ctx)).status).toBe(200);
   });
@@ -128,6 +129,7 @@ describe('Minor 2: request_id', () => {
       const env = {
         UPSTASH_REDIS_REST_URL: 'https://r.test', UPSTASH_REDIS_REST_TOKEN: 't',
         SUPABASE_URL: 'https://d.test', SUPABASE_SERVICE_ROLE_KEY: 's', CREDENTIAL_ENCRYPTION_KEY: 'k',
+        USAGE_QUEUE: { send: async () => {} } as never,
       };
       const res = await worker.fetch(
         proxyRequest({ headers: { 'x-request-id': 'client-chosen' } }),

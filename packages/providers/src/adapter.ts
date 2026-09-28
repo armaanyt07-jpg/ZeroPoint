@@ -1,4 +1,4 @@
-import type { ProviderId, ProviderUsage } from '@zeropoint/types';
+import type { PartialUsage, ProviderId, ProviderUsage } from '@zeropoint/types';
 
 /**
  * The contract every LLM provider integration implements (SRS NFR-5.6).
@@ -8,6 +8,10 @@ import type { ProviderId, ProviderUsage } from '@zeropoint/types';
  *   because FR-1.3 requires swapping the proxy credential for the provider
  *   credential and the SRS signature gave the adapter no way to receive it.
  * - `matchesPath` lets the router recognise each provider's URL shape.
+ * - Phase 2: SSE decoding is provider-agnostic and lives in `SseParser` (a frame
+ *   can span chunks, which a stateless chunk-in/usage-out method cannot handle),
+ *   so the adapter's real job is `extractUsage`: turn one decoded JSON payload
+ *   into normalized usage. `parseStreamChunk` remains as a one-shot convenience.
  */
 export interface LLMProviderAdapter {
   readonly id: ProviderId;
@@ -25,8 +29,21 @@ export interface LLMProviderAdapter {
   /** Builds the upstream request: provider URL, allow-listed headers, provider credential. */
   buildProviderRequest(request: Request, providerApiKey: string): Promise<Request>;
 
-  /** PHASE 2: incrementally extract usage from an SSE chunk. Phase 1 always returns null. */
+  /**
+   * One-shot: usage from a self-contained chunk of SSE text (SRS signature).
+   * The proxy itself uses `SseParser` + `extractUsage` so frames may span chunks.
+   */
   parseStreamChunk(chunk: Uint8Array): ProviderUsage | null;
+
+  /**
+   * Usage revealed by ONE parsed JSON payload: a streamed SSE event's `data`, or
+   * a complete non-streaming response body. Returns null when it says nothing
+   * about usage. Never throws on unexpected shapes.
+   */
+  extractUsage(payload: unknown): PartialUsage | null;
+
+  /** Fallback model name from the request path (Gemini puts it in the URL). */
+  modelFromPath?(pathname: string): string | null;
 
   /** Cost in USD for normalized usage, using this adapter's pricing table. */
   calculateCost(usage: ProviderUsage): number;

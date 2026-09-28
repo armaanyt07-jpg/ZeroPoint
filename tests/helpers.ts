@@ -1,6 +1,8 @@
 import { encryptSecret, generateEncryptionKey, sha256Hex } from '@zeropoint/crypto';
 import { createDefaultRegistry } from '@zeropoint/providers';
+import type { UsageEvent } from '@zeropoint/types';
 import { vi } from 'vitest';
+import { runLuaScript } from './lua-redis';
 import { Directory } from '../apps/worker/src/directory';
 import type { Dependencies } from '../apps/worker/src/deps';
 import type { RedisClient } from '../apps/worker/src/redis';
@@ -12,6 +14,9 @@ import {
   type TenantStore,
 } from '../apps/worker/src/store';
 import type { MetricName, Telemetry } from '../apps/worker/src/telemetry';
+import type { UsageQueue } from '../apps/worker/src/usage-queue';
+import type { UsageStore } from '../apps/worker/src/store';
+import type { SettlementDeps } from '../apps/worker/src/settlement';
 
 export class FakeRedis implements RedisClient {
   data = new Map<string, string>();
@@ -24,6 +29,9 @@ export class FakeRedis implements RedisClient {
   hangOnSet = false;
   private inFlight = 0;
   maxInFlight = 0;
+  /** Number of upcoming EVALs that fail (a flapping Redis during settlement). */
+  evalFailures = 0;
+  evalCalls = 0;
 
   async get(key: string) {
     this.getCalls.push(key);
@@ -36,6 +44,16 @@ export class FakeRedis implements RedisClient {
     } finally {
       this.inFlight--;
     }
+  }
+  /** Executes the real Lua script text (see lua-redis.ts) against the in-memory data. */
+  async eval(script: string, keys: string[], args: (string | number)[]) {
+    this.evalCalls++;
+    if (this.failing) throw new RedisError('down');
+    if (this.evalFailures > 0) {
+      this.evalFailures--;
+      throw new RedisError('flapping');
+    }
+    return runLuaScript(script, keys, args, this.data);
   }
   async set(key: string, value: string, ttl?: number) {
     if (this.hangOnSet) return new Promise<void>(() => {});
@@ -75,10 +93,49 @@ export class FakeStore implements TenantStore {
   }
 }
 
+/** In-memory UsageQueue. `failures` = how many upcoming sends throw. */
+export class FakeUsageQueue implements UsageQueue {
+  sent: UsageEvent[] = [];
+  failures = 0;
+  attempts = 0;
+  async send(event: UsageEvent) {
+    this.attempts++;
+    if (this.failures > 0) {
+      this.failures--;
+      throw new Error('queue down');
+    }
+    this.sent.push(event);
+  }
+}
+
+/** In-memory settle_usage: idempotent by request id, like the SQL function. */
+export class FakeUsageStore implements UsageStore {
+  logs = new Map<string, UsageEvent>();
+  spend = new Map<string, number>();
+  failures = 0;
+  calls = 0;
+  async settleUsage(event: UsageEvent) {
+    this.calls++;
+    if (this.failures > 0) {
+      this.failures--;
+      throw new StoreError('db down');
+    }
+    if (this.logs.has(event.requestId)) return false;
+    this.logs.set(event.requestId, event);
+    const key = `${event.tenantId}:${event.externalUserId}`;
+    this.spend.set(key, (this.spend.get(key) ?? 0) + event.estimatedCostUsd);
+    return true;
+  }
+}
+
 export class FakeTelemetry implements Telemetry {
-  events: { metric: MetricName; tags: Record<string, string> }[] = [];
-  increment(metric: MetricName, tags: Record<string, string> = {}) {
-    this.events.push({ metric, tags });
+  events: { metric: MetricName; tags: Record<string, string>; value: number }[] = [];
+  increment(metric: MetricName, tags: Record<string, string> = {}, value = 1) {
+    this.events.push({ metric, tags, value });
+  }
+  /** Sum of the values recorded for a metric. */
+  sum(metric: MetricName) {
+    return this.events.filter((e) => e.metric === metric).reduce((total, e) => total + e.value, 0);
   }
   count(metric: MetricName) {
     return this.events.filter((e) => e.metric === metric).length;
@@ -103,9 +160,11 @@ export interface Harness {
   store: FakeStore;
   telemetry: FakeTelemetry;
   providerFetch: ReturnType<typeof vi.fn>;
+  queue: FakeUsageQueue;
+  usageStore: FakeUsageStore;
   deps: Dependencies;
   encryptionKey: string;
-  /** Background work handed to ctx.waitUntil (cache writes). */
+  /** Background work handed to ctx.waitUntil (cache writes, usage tracking). */
   deferred: Promise<unknown>[];
   /** Waits for all background work, like the Workers runtime does after the response. */
   flush(): Promise<void>;
@@ -135,18 +194,23 @@ export async function createHarness(): Promise<Harness> {
   );
 
   const deferred: Promise<unknown>[] = [];
+  const queue = new FakeUsageQueue();
+  const usageStore = new FakeUsageStore();
+  const defer = (work: Promise<unknown>) => void deferred.push(work);
   const deps: Dependencies = {
     redis,
-    directory: new Directory(redis, store, telemetry, (work) => void deferred.push(work)),
+    directory: new Directory(redis, store, telemetry, defer),
     telemetry,
     providers: createDefaultRegistry(),
     encryptionKey,
     fetch: providerFetch as unknown as typeof fetch,
+    usageQueue: queue,
+    defer,
   };
   const flush = async () => {
     await Promise.all(deferred.splice(0));
   };
-  return { redis, store, telemetry, providerFetch, deps, encryptionKey, deferred, flush };
+  return { redis, store, telemetry, providerFetch, queue, usageStore, deps, encryptionKey, deferred, flush };
 }
 
 export function proxyRequest(
@@ -181,4 +245,39 @@ export async function addCredential(h: Harness, provider: string, plaintext: str
     `${TENANT_ID}:${provider}`,
     await encryptSecret(plaintext, h.encryptionKey, `${TENANT_ID}:${provider}`),
   );
+}
+
+/** What the queue consumer needs, wired to the harness's fakes. */
+export function settlementDeps(h: Harness): SettlementDeps {
+  return { redis: h.redis, store: h.usageStore, telemetry: h.telemetry };
+}
+
+/** A queue message wrapper that records ack/retry, like Cloudflare's Message. */
+export class FakeMessage {
+  acked = false;
+  retried: { delaySeconds?: number } | null = null;
+  constructor(
+    readonly body: unknown,
+    readonly attempts = 1,
+  ) {}
+  ack() {
+    this.acked = true;
+  }
+  retry(options: { delaySeconds?: number } = {}) {
+    this.retried = options;
+  }
+}
+
+/** Builds an SSE-shaped provider response from text or byte chunks, delivered one per read. */
+export function sseResponse(chunks: (string | Uint8Array)[], contentType = 'text/event-stream'): Response {
+  const encoder = new TextEncoder();
+  let index = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = chunks[index++];
+      if (chunk === undefined) controller.close();
+      else controller.enqueue(typeof chunk === 'string' ? encoder.encode(chunk) : chunk);
+    },
+  });
+  return new Response(body, { headers: { 'content-type': contentType } });
 }

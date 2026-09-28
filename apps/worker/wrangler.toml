@@ -8,3 +8,19 @@ compatibility_date = "2026-09-01"
 
 [observability]
 enabled = true
+
+# Usage events (FR-2.3): the request path produces, the same Worker consumes.
+# Create both queues once:  wrangler queues create zeropoint-usage
+#                           wrangler queues create zeropoint-usage-dlq
+[[queues.producers]]
+binding = "USAGE_QUEUE"
+queue = "zeropoint-usage"
+
+[[queues.consumers]]
+queue = "zeropoint-usage"
+max_batch_size = 10
+max_batch_timeout = 5
+# Settlement retries with backoff (see retryDelaySeconds); after this many
+# attempts a message goes to the dead-letter queue instead of being lost.
+max_retries = 10
+dead_letter_queue = "zeropoint-usage-dlq"

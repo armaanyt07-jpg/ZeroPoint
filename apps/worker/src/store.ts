@@ -1,4 +1,4 @@
-import type { ApiKeyStatus, EndUserStatus, ProviderId } from '@zeropoint/types';
+import type { ApiKeyStatus, EndUserStatus, ProviderId, UsageEvent } from '@zeropoint/types';
 
 /** Rows we need from PostgreSQL (the durable system of record, SRS 4.1). */
 export interface ApiKeyRecord {
@@ -21,6 +21,16 @@ export interface TenantStore {
   findEndUser(tenantId: string, externalUserId: string): Promise<EndUserRecord | null>;
   /** Returns the AES-GCM ciphertext string (never plaintext). */
   findProviderCredential(tenantId: string, provider: ProviderId): Promise<string | null>;
+}
+
+/** The one database write the Worker performs (FR-2.3): durable, idempotent settlement. */
+export interface UsageStore {
+  /**
+   * Inserts the request log and adds its cost to the user's spend, in one
+   * transaction, at most once per `requestId` (FR-2.4). Resolves true if this call
+   * settled the request, false if it had already been settled.
+   */
+  settleUsage(event: UsageEvent): Promise<boolean>;
 }
 
 export class StoreError extends Error {
@@ -54,12 +64,13 @@ function num(row: Row, field: string): number {
  * which works from a Worker without a database driver. The service-role key
  * bypasses Row Level Security, so it must stay a Worker secret (see migration 003).
  */
-export class SupabaseStore implements TenantStore {
+export class SupabaseStore implements TenantStore, UsageStore {
   constructor(
     private readonly baseUrl: string,
     private readonly serviceRoleKey: string,
     private readonly fetchImpl: typeof fetch = (input, init) => fetch(input, init),
     private readonly timeoutMs = 2000,
+    private readonly writeTimeoutMs = 5000,
   ) {}
 
   async findApiKeyByHash(keyHash: string): Promise<ApiKeyRecord | null> {
@@ -105,6 +116,45 @@ export class SupabaseStore implements TenantStore {
       provider: `eq.${provider}`,
     });
     return row ? str(row, 'encrypted_api_key') : null;
+  }
+
+  /** Calls the `settle_usage` SQL function (migration 005) through PostgREST RPC. */
+  async settleUsage(event: UsageEvent): Promise<boolean> {
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/rest/v1/rpc/settle_usage`, {
+        method: 'POST',
+        headers: {
+          apikey: this.serviceRoleKey,
+          authorization: `Bearer ${this.serviceRoleKey}`,
+          'content-type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify({
+          p_request_id: event.requestId,
+          p_tenant_id: event.tenantId,
+          p_external_user_id: event.externalUserId,
+          p_provider: event.provider,
+          p_model: event.model,
+          p_status_code: event.statusCode,
+          p_input_tokens: event.inputTokens,
+          p_output_tokens: event.outputTokens,
+          p_total_tokens: event.totalTokens,
+          p_estimated_cost_usd: event.estimatedCostUsd,
+          p_usage_source: event.usageSource,
+          p_latency_ms: event.latencyMs,
+          p_streaming: event.streaming,
+          p_created_at: event.occurredAt,
+        }),
+        signal: AbortSignal.timeout(this.writeTimeoutMs),
+      });
+    } catch {
+      throw new StoreError('Database request failed or timed out.');
+    }
+    if (!response.ok) throw new StoreError(`Database returned HTTP ${response.status}.`);
+    const result = (await response.json()) as unknown;
+    if (typeof result !== 'boolean') throw new StoreError('Unexpected database response.');
+    return result;
   }
 
   private async selectOne(table: string, query: Record<string, string>): Promise<Row | null> {

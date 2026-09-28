@@ -1,4 +1,5 @@
-import type { ProviderId } from '@zeropoint/types';
+import { DEFAULT_PRICING } from '@zeropoint/pricing';
+import type { ModelPricing, ProviderId } from '@zeropoint/types';
 import type { LLMProviderAdapter } from './adapter';
 import { AnthropicAdapter } from './anthropic';
 import { GeminiAdapter } from './gemini';
@@ -26,6 +27,10 @@ export class ProviderRegistry {
   }
 }
 
-export function createDefaultRegistry(): ProviderRegistry {
-  return new ProviderRegistry([new OpenAIAdapter(), new AnthropicAdapter(), new GeminiAdapter()]);
+export function createDefaultRegistry(pricing: readonly ModelPricing[] = DEFAULT_PRICING): ProviderRegistry {
+  return new ProviderRegistry([
+    new OpenAIAdapter(pricing),
+    new AnthropicAdapter(pricing),
+    new GeminiAdapter(pricing),
+  ]);
 }

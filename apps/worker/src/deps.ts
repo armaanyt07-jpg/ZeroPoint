@@ -1,7 +1,7 @@
 import { UpstashRedis, type RedisClient } from './redis';
 import { Directory } from './directory';
 import { ZeroPointError } from './errors';
-import { SupabaseStore, type CircuitBreakerStore } from './store';
+import { SupabaseStore, type ApiKeyUsageStore, type CircuitBreakerStore } from './store';
 import type { SettlementDeps } from './settlement';
 import type { Telemetry } from './telemetry';
 import type { Env } from './env';
@@ -23,6 +23,8 @@ export interface Dependencies {
   webhookQueue: WebhookQueue;
   /** Records circuit-breaker trips for the audit trail (FR-3.4). */
   circuitBreakerStore: CircuitBreakerStore;
+  /** Records `api_keys.last_used_at` (Phase 4, D11). */
+  apiKeyStore: ApiKeyUsageStore;
   /** Runs work after the response is returned (`ctx.waitUntil`). */
   defer: (work: Promise<unknown>) => void;
 }
@@ -70,6 +72,7 @@ export function createDependencies(
       },
     },
     circuitBreakerStore: store,
+    apiKeyStore: store,
     defer,
   };
 }

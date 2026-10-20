@@ -1,3 +1,8 @@
+packages:
+  - apps/dashboard
+  - packages/*
 allowBuilds:
   esbuild: true
   workerd: true
+  sharp: false
+  unrs-resolver: false

@@ -255,3 +255,71 @@ See the Tests section of `docs/PHASE_3.md`. Two real bugs were caught this way: 
 `tests/**`, `docs/PHASE_3.md`, `docs/CHANGELOG.md`, `README.md`, `database/README.md`.
 ### How To Verify
 `pnpm check` and `pnpm build:check`.
+
+## Step 15 - Phase 4 plan
+### What Changed
+`docs/PHASE_4_PLAN.md`: FR-4.1/4.2 and SRS section 12 mapped to files, with the owner's four choices (admin auth, scope, pricing, hosting) and decisions D5-D12.
+### Why
+Phase 4 adds a second application with its own security boundary, shares secrets with the Worker, and changes how the Worker prices requests. All of that needed agreeing before code.
+### Files Changed
+`docs/PHASE_4_PLAN.md`.
+### How To Verify
+Read it against `docs/ZeroPoint_SRS_v1.0.pdf` sections 3 (Phase 4), 12, 14, 15 and 17.
+
+## Step 16 - Shared packages, migration 007 and Worker changes
+### What Changed
+- `packages/schemas` (new): Redis cache-key builders, the supported-provider list, and the `x-user-id` rule.
+- `generateProxyKey()` in `packages/crypto`.
+- Dated-snapshot price matching in `packages/pricing`.
+- Migration 007: `admins`, `model_prices`, and four `dashboard_*` aggregate functions (service-role only).
+- The Worker prices usage from `model_prices` and records `api_keys.last_used_at`, throttled.
+### Why
+- Without prices every request costs $0, so budgets and the velocity breaker can never trip.
+- Prices had to be editable without a redeploy (owner decision D3).
+- The dashboard must invalidate exactly the cache keys the Worker reads, so both import one definition.
+### How It Works
+- `usage-extractor.ts` loads the price table through the `Directory` cache (`cache:pricing`, 60 s), only when there is usage to price. It fixes the cost into the usage event, so a queue retry after a price edit cannot charge Redis and Postgres differently. A failed price read records the request as unpriced rather than dropping it.
+- `findPricing` tries an exact match, then the model with its version suffix stripped. So `gpt-4o-mini-2024-07-18` uses the `gpt-4o-mini` price, and `gpt-4o-mini` never falls back to `gpt-4o`.
+- `recordKeyUse` (`auth.ts`) runs under `waitUntil`. A Lua `SET NX EX 300` allows at most one `PATCH api_keys` per key per 5 minutes. When Redis is down it skips the write instead of writing on every request.
+- Every `packages/*` got a minimal `package.json` so the dashboard can depend on them. The Worker still resolves them through TS paths, as before.
+### Files Changed
+`packages/{schemas,crypto,pricing}/**`, `packages/*/package.json`, `pnpm-workspace.yaml`, `database/migrations/007_dashboard.sql`, `apps/worker/src/{auth,pipeline,store,directory,deps}.ts`, `apps/worker/src/streaming/usage-extractor.ts`, `scripts/dev-helper.ts` (`add-admin`, shared key generator), `tsconfig.json`, `vitest.config.ts`.
+### Important Concepts
+Read-through caching of a whole small table; freezing a derived value (cost) at the moment it is computed so retries stay consistent; throttling writes with an atomic Redis `SET NX EX`.
+### How To Verify
+`pnpm test tests/unit/migrations.test.ts tests/unit/pricing.test.ts tests/unit/crypto.test.ts tests/integration/dashboard-worker.test.ts`
+
+## Step 17 - Admin dashboard (FR-4.1, FR-4.2, SRS 12)
+### What Changed
+`apps/dashboard`: Next.js 16, React 19, Tailwind 4 and shadcn/ui, deployed to Vercel. It has these pages:
+- Sign-in by magic link.
+- Tenants, and a new-tenant form.
+- Per tenant: Overview (stat tiles, daily spend chart, spend-per-user chart, top spenders, circuit-breaker events), Users & budgets, Proxy keys, Provider credentials, Settings, Operations.
+- Model prices (global).
+### Why
+SRS Phase 4 and section 12. It replaces hand-seeding the database with `pnpm helper` and SQL.
+### How It Works
+- Pages read through `getAdminDb()`, the admin check plus the service-role client.
+- Writes go through `adminAction()`, which runs the admin check, then zod validation, then the handler, then an audit log line.
+- Admin = a confirmed Supabase Auth email that appears in `admins`.
+- After each write, the dashboard deletes the Worker's matching Redis cache entries.
+- Keys are shown once, and only their SHA-256 is stored. Provider keys are encrypted with the Worker's AES-GCM key and AAD.
+- Charts follow the dataviz method: one validated hue, thin marks, a table view, and hover tooltips.
+### Files Changed
+`apps/dashboard/**`, root `package.json` (`dashboard`, `dashboard:build`; `typecheck`/`lint` include the dashboard), `eslint.config.js`, `tests/server-only-stub.ts`.
+### Important Concepts
+Server Actions as public endpoints; Data Access Layer; show-once secrets; React 19 form reset (D14); feedback for a form that the action's own re-render unmounts (D15).
+### How To Verify
+`pnpm dashboard` with `apps/dashboard/.env.local` (see `.env.example`), then sign in with an allowlisted email.
+
+## Step 18 - Phase 4 tests and verification
+### What Changed
+63 new tests (448 total), `docs/PHASE_4.md`, README.
+### Why
+The dashboard concentrates the most powerful secrets. The tests pin the admin check (including a static check that every action is wrapped), the input rules, and the SQL aggregates. An end-to-end run exercised the real schema through PostgREST.
+### How It Works
+See the Tests section of `docs/PHASE_4.md`. The end-to-end run found two real bugs and fixed them: a failed submit erased the form (React 19 form reset), and revoking a key showed no confirmation because the form unmounted before its effect ran. It also caught chart axis ticks that all read "$0".
+### Files Changed
+`tests/**`, `apps/dashboard/tests/**`, `docs/PHASE_4.md`, `docs/CHANGELOG.md`, `README.md`, `database/README.md`.
+### How To Verify
+`pnpm check`, `pnpm build:check` and `pnpm dashboard:build`.

@@ -16,9 +16,10 @@
       "@zeropoint/types": ["./packages/types/src/index.ts"],
       "@zeropoint/crypto": ["./packages/crypto/src/index.ts"],
       "@zeropoint/pricing": ["./packages/pricing/src/index.ts"],
-      "@zeropoint/providers": ["./packages/providers/src/index.ts"]
+      "@zeropoint/providers": ["./packages/providers/src/index.ts"],
+      "@zeropoint/schemas": ["./packages/schemas/src/index.ts"]
     }
   },
   "include": ["apps", "packages", "tests"],
-  "exclude": ["tests/unit/migrations.test.ts"]
+  "exclude": ["tests/unit/migrations.test.ts", "apps/dashboard"]
 }

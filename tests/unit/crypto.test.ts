@@ -1,4 +1,4 @@
-import { CryptoError, decryptSecret, encryptSecret, generateEncryptionKey, sha256Hex } from '@zeropoint/crypto';
+import { CryptoError, decryptSecret, encryptSecret, generateEncryptionKey, generateProxyKey, sha256Hex } from '@zeropoint/crypto';
 import { describe, expect, it } from 'vitest';
 
 describe('sha256Hex', () => {
@@ -45,5 +45,21 @@ describe('AES-256-GCM', () => {
     await expect(decryptSecret('garbage', key, 'a')).rejects.toThrow('Unsupported ciphertext format');
     await expect(encryptSecret('x', btoa('short'), 'a')).rejects.toThrow('32 bytes');
     await expect(encryptSecret('x', '***not base64***', 'a')).rejects.toThrow(CryptoError);
+  });
+});
+
+describe('generateProxyKey (FR-4.1)', () => {
+  it('produces pk_live_<32 base64url chars>, its SHA-256 and a 12-char prefix', async () => {
+    const { key, keyHash, keyPrefix } = await generateProxyKey();
+    expect(key).toMatch(/^pk_live_[A-Za-z0-9_-]{32}$/);
+    expect(keyHash).toBe(await sha256Hex(key));
+    expect(keyHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(keyPrefix).toBe(key.slice(0, 12));
+    expect(keyPrefix.startsWith('pk_live_')).toBe(true);
+  });
+
+  it('never repeats', async () => {
+    const keys = await Promise.all(Array.from({ length: 50 }, () => generateProxyKey()));
+    expect(new Set(keys.map((k) => k.key)).size).toBe(50);
   });
 });

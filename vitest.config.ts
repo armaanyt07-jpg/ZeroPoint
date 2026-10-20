@@ -6,12 +6,17 @@ const pkg = (name: string) =>
 
 export default defineConfig({
   resolve: {
-    alias: {
-      '@zeropoint/types': pkg('types'),
-      '@zeropoint/crypto': pkg('crypto'),
-      '@zeropoint/pricing': pkg('pricing'),
-      '@zeropoint/providers': pkg('providers'),
-    },
+    alias: [
+      { find: '@zeropoint/types', replacement: pkg('types') },
+      { find: '@zeropoint/crypto', replacement: pkg('crypto') },
+      { find: '@zeropoint/pricing', replacement: pkg('pricing') },
+      { find: '@zeropoint/providers', replacement: pkg('providers') },
+      { find: '@zeropoint/schemas', replacement: pkg('schemas') },
+      // Dashboard (apps/dashboard/tests): its "@/..." imports, and the `server-only`
+      // guard, which throws outside a React Server Components bundle.
+      { find: /^@\//, replacement: fileURLToPath(new URL('./apps/dashboard/', import.meta.url)) },
+      { find: 'server-only', replacement: fileURLToPath(new URL('./tests/server-only-stub.ts', import.meta.url)) },
+    ],
   },
-  test: { include: ['tests/**/*.test.ts'] },
+  test: { include: ['tests/**/*.test.ts', 'apps/dashboard/tests/**/*.test.ts'] },
 });

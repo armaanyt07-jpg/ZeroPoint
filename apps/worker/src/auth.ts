@@ -1,11 +1,13 @@
 import type { TenantPolicy } from '@zeropoint/types';
-import { sha256Hex } from '@zeropoint/crypto';
+import { PROXY_KEY_PREFIX, sha256Hex } from '@zeropoint/crypto';
+import { isValidExternalUserId, lastUsedKey } from '@zeropoint/schemas';
 import type { Directory } from './directory';
 import { ZeroPointError } from './errors';
-import type { EndUserRecord } from './store';
+import type { RedisClient } from './redis';
+import type { ApiKeyUsageStore, EndUserRecord } from './store';
+import type { Telemetry } from './telemetry';
 
-export const PROXY_KEY_PREFIX = 'pk_live_';
-const MAX_USER_ID_LENGTH = 128;
+export { PROXY_KEY_PREFIX };
 
 /** Who is calling, established by authenticate(). */
 export interface AuthContext {
@@ -51,7 +53,7 @@ export async function authenticate(request: Request, directory: Directory): Prom
 
   const userId = extractUserId(request.headers);
   if (!userId) throw unauthorized();
-  if (userId.length > MAX_USER_ID_LENGTH || /[\u0000-\u001f\u007f]/.test(userId)) {
+  if (!isValidExternalUserId(userId)) {
     throw new ZeroPointError(400, 'INVALID_USER_ID', 'Invalid x-user-id header.');
   }
 
@@ -68,5 +70,43 @@ export async function authenticate(request: Request, directory: Directory): Prom
 export function assertUserAllowed(user: EndUserRecord | null): void {
   if (user && user.status !== 'active') {
     throw new ZeroPointError(403, 'USER_BLOCKED', 'This user is not permitted to make requests.');
+  }
+}
+
+/** At most one `api_keys.last_used_at` write per key per this many seconds (Phase 4, D11). */
+export const LAST_USED_THROTTLE_SECONDS = 300;
+
+/** SET NX: 1 if this call claimed the throttle window (so it should write), else 0. */
+export const LAST_USED_SCRIPT = `
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
+  return 1
+end
+return 0
+`;
+
+/**
+ * Records that a proxy key was used, for the dashboard's key list. Runs under
+ * `ctx.waitUntil`, so it never adds latency, and never throws: it is bookkeeping,
+ * not governance. Redis throttles it to one database write per key per window.
+ */
+export async function recordKeyUse(
+  redis: RedisClient,
+  store: ApiKeyUsageStore,
+  telemetry: Telemetry,
+  apiKeyId: string,
+  now = Date.now(),
+): Promise<void> {
+  let claimed: boolean;
+  try {
+    claimed = Number(await redis.eval(LAST_USED_SCRIPT, [lastUsedKey(apiKeyId)], [LAST_USED_THROTTLE_SECONDS])) === 1;
+  } catch {
+    telemetry.increment('redis_failures', { operation: 'last_used' });
+    return; // without the throttle every request would write; skip instead
+  }
+  if (!claimed) return;
+  try {
+    await store.touchApiKey(apiKeyId, new Date(now).toISOString());
+  } catch (error) {
+    console.error(JSON.stringify({ type: 'last_used_write_failed', name: (error as Error)?.name }));
   }
 }

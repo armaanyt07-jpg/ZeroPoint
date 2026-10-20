@@ -30,7 +30,7 @@ describe('migrations apply cleanly, in order', () => {
   it('creates every table', async () => {
     const { rows } = await db.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1`);
     expect(rows.map((r) => (r as { table_name: string }).table_name)).toEqual([
-      'api_keys', 'circuit_breaker_events', 'end_users', 'request_logs', 'tenant_provider_credentials', 'tenants',
+      'admins', 'api_keys', 'circuit_breaker_events', 'end_users', 'model_prices', 'request_logs', 'tenant_provider_credentials', 'tenants',
     ]);
   });
 
@@ -211,5 +211,114 @@ describe('circuit_breaker_events (migration 006, FR-3.4 "record the event")', ()
   it('has row level security enabled, like every other table', async () => {
     const { rows } = await db.query(`SELECT relrowsecurity FROM pg_class WHERE relname='circuit_breaker_events'`);
     expect((rows[0] as { relrowsecurity: boolean }).relrowsecurity).toBe(true);
+  });
+});
+
+describe('dashboard (migration 007, FR-4.1 / FR-4.2)', () => {
+  const REQ = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const DAY = 24 * 60 * 60 * 1000;
+  const ago = (days: number) => new Date(Date.now() - days * DAY).toISOString();
+  const settleAt = (tenant: string, n: number, user: string, cost: number, at: string, source = 'provider_reported', model = 'gpt-x') =>
+    db.query(`SELECT settle_usage($1,$2,$3,'openai',$4,200,10,5,15,$5,$6,1,FALSE,$7)`, [REQ(n), tenant, user, model, cost, source, at]);
+  const trip = (tenant: string, user: string, expiresInMinutes: number) =>
+    db.query(
+      `INSERT INTO circuit_breaker_events (tenant_id, external_user_id, reason, opened_at, expires_at)
+       VALUES ($1,$2,'loop',NOW(),NOW() + make_interval(mins => $3))`,
+      [tenant, user, expiresInMinutes],
+    );
+
+  it('admins are stored lowercase and must look like an email', async () => {
+    await expect(db.query(`INSERT INTO admins (email) VALUES ('ops@example.com')`)).resolves.toBeDefined();
+    await expect(db.query(`INSERT INTO admins (email) VALUES ('Ops@Example.com')`)).rejects.toThrow(/check/i);
+    await expect(db.query(`INSERT INTO admins (email) VALUES ('not-an-email')`)).rejects.toThrow(/check/i);
+    await expect(db.query(`INSERT INTO admins (email) VALUES ('ops@example.com')`)).rejects.toThrow(/unique|duplicate/i);
+  });
+
+  it('model prices are unique per provider+model and never negative', async () => {
+    const insert = (model: string, input: number, output: number) =>
+      db.query(`INSERT INTO model_prices (provider, model, input_per_million_usd, output_per_million_usd) VALUES ('openai',$1,$2,$3)`, [model, input, output]);
+    await expect(insert('m1', 0.15, 0.6)).resolves.toBeDefined();
+    await expect(insert('m1', 1, 1)).rejects.toThrow(/unique|duplicate/i);
+    await expect(insert('m2', -0.01, 1)).rejects.toThrow(/check/i);
+    await expect(insert('', 1, 1)).rejects.toThrow(/check/i);
+  });
+
+  it('enables row level security on admins and model_prices', async () => {
+    const { rows } = await db.query(`SELECT relrowsecurity FROM pg_class WHERE relname IN ('admins','model_prices')`);
+    expect(rows).toHaveLength(2);
+    for (const r of rows as { relrowsecurity: boolean }[]) expect(r.relrowsecurity).toBe(true);
+  });
+
+  it('summarizes spend, requests, tokens, active users and open circuits for one tenant and range', async () => {
+    const tenant = await newTenant();
+    const other = await newTenant();
+    await settleAt(tenant, 5001, 'a', 1.5, ago(1));
+    await settleAt(tenant, 5002, 'a', 0.5, ago(2));
+    await settleAt(tenant, 5003, 'b', 2, ago(3));
+    await settleAt(tenant, 5004, 'c', 100, ago(40)); // outside a 30-day range
+    await settleAt(other, 5005, 'a', 7, ago(1)); // another tenant
+    await trip(tenant, 'a', 10);
+    await trip(tenant, 'a', 15); // same user twice counts once
+    await trip(tenant, 'b', -1); // already expired
+    const s = await one(`SELECT * FROM dashboard_summary($1, $2)`, [tenant, ago(30)]);
+    expect(Number(s['total_spend_usd'])).toBe(4);
+    expect(Number(s['request_count'])).toBe(3);
+    expect([Number(s['input_tokens']), Number(s['output_tokens']), Number(s['total_tokens'])]).toEqual([30, 15, 45]);
+    expect(Number(s['active_users'])).toBe(2);
+    expect(Number(s['open_circuits'])).toBe(1);
+  });
+
+  it('summary of a tenant with no traffic is all zeros, not nulls', async () => {
+    const s = await one(`SELECT * FROM dashboard_summary($1, $2)`, [await newTenant(), ago(30)]);
+    expect(Object.values(s).map(Number)).toEqual([0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  it('daily spend has one zero-filled row per UTC day, oldest first', async () => {
+    const tenant = await newTenant();
+    await settleAt(tenant, 5101, 'a', 1, ago(0));
+    await settleAt(tenant, 5102, 'a', 2, ago(0));
+    await settleAt(tenant, 5103, 'a', 4, ago(3));
+    const { rows } = await db.query(`SELECT * FROM dashboard_daily_spend($1, $2)`, [tenant, ago(6)]);
+    const days = rows as { day: Date | string; spend_usd: string; request_count: string }[];
+    expect(days).toHaveLength(7);
+    const spend = days.map((d) => Number(d.spend_usd));
+    expect(spend.at(-1)).toBe(3);
+    expect(spend.reduce((a, b) => a + b, 0)).toBe(7);
+    expect(spend.filter((v) => v === 0)).toHaveLength(5);
+    expect(Number(days.at(-1)?.request_count)).toBe(2);
+  });
+
+  it('top spenders are ordered by spend and limited', async () => {
+    const tenant = await newTenant();
+    await settleAt(tenant, 5201, 'low', 1, ago(1));
+    await settleAt(tenant, 5202, 'high', 9, ago(1));
+    await settleAt(tenant, 5203, 'mid', 3, ago(1));
+    await settleAt(tenant, 5204, 'mid', 3, ago(2));
+    const { rows } = await db.query(`SELECT * FROM dashboard_top_spenders($1, $2, 2)`, [tenant, ago(30)]);
+    expect(rows.map((r) => (r as { external_user_id: string }).external_user_id)).toEqual(['high', 'mid']);
+    expect(Number((rows[1] as { request_count: string }).request_count)).toBe(2);
+  });
+
+  it('lists models whose requests were recorded without a price', async () => {
+    const tenant = await newTenant();
+    await settleAt(tenant, 5301, 'a', 0, ago(1), 'unknown', 'mystery-model');
+    await settleAt(tenant, 5302, 'a', 0, ago(2), 'unknown', 'mystery-model');
+    await settleAt(tenant, 5303, 'a', 1, ago(1), 'provider_reported', 'priced-model');
+    const { rows } = await db.query(`SELECT * FROM dashboard_unpriced_models($1, $2)`, [tenant, ago(30)]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: 'openai', model: 'mystery-model' });
+    expect(Number((rows[0] as { request_count: string }).request_count)).toBe(2);
+  });
+
+  it('aggregate functions are not executable by PUBLIC', async () => {
+    for (const fn of [
+      'dashboard_summary(uuid,timestamptz)',
+      'dashboard_daily_spend(uuid,timestamptz)',
+      'dashboard_top_spenders(uuid,timestamptz,integer)',
+      'dashboard_unpriced_models(uuid,timestamptz)',
+    ]) {
+      const { rows } = await db.query(`SELECT has_function_privilege('public', '${fn}', 'EXECUTE') AS ok`);
+      expect((rows[0] as { ok: boolean }).ok, fn).toBe(false);
+    }
   });
 });

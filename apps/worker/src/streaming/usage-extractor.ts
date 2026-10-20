@@ -1,6 +1,7 @@
+import { calculateCostUsd, findPricing } from '@zeropoint/pricing';
 import { SseParser, mayContainUsage, mergeUsage } from '@zeropoint/providers';
 import type { LLMProviderAdapter } from '@zeropoint/providers';
-import type { PartialUsage, UsageEvent, UsageSource } from '@zeropoint/types';
+import type { ModelPricing, PartialUsage, UsageEvent, UsageSource } from '@zeropoint/types';
 import type { Telemetry } from '../telemetry';
 import { dispatchUsageEvent, type RetryOptions, type UsageQueue } from '../usage-queue';
 
@@ -23,6 +24,11 @@ export interface UsageContext {
   defer: (work: Promise<unknown>) => void;
   /** Overrides queue retry timing (tests). */
   queueRetry?: Partial<RetryOptions>;
+  /**
+   * The administrator-entered price table (Phase 4, D9), loaded only when a
+   * request actually has usage to price. Absent = only the adapter's static table.
+   */
+  loadPrices?: () => Promise<readonly ModelPricing[]>;
 }
 
 export interface UsageResponseInfo {
@@ -116,6 +122,14 @@ export async function readUsageFromJson(
   }
 }
 
+/** The model a usage report belongs to: what the provider said, else (Gemini) the URL. */
+const resolveModel = (adapter: LLMProviderAdapter, info: UsageResponseInfo, usage: PartialUsage) =>
+  usage.model ?? adapter.modelFromPath?.(info.pathname) ?? null;
+
+/** Pricing needs both token counts and a model; anything less is never priced. */
+const isPriceable = (adapter: LLMProviderAdapter, info: UsageResponseInfo, usage: PartialUsage) =>
+  usage.inputTokens !== undefined && usage.outputTokens !== undefined && resolveModel(adapter, info, usage) !== null;
+
 /**
  * Normalizes what was found into the queue message (SRS section 9).
  *
@@ -123,6 +137,10 @@ export async function readUsageFromJson(
  * counts AND the model has a price. Otherwise 'unknown' and cost 0 (D3): the
  * SRS defines no price values and no token estimator, so nothing is guessed.
  * Token counts that WERE reported are still stored.
+ *
+ * Prices: the administrator-entered table (`prices`, Phase 4 D9) wins; the
+ * adapter's static table is the fallback. The cost is fixed here, in the event,
+ * so a queue retry after a price edit can never charge Redis and Postgres differently.
  */
 export function buildUsageEvent(
   adapter: LLMProviderAdapter,
@@ -131,15 +149,19 @@ export function buildUsageEvent(
   usage: PartialUsage,
   streaming: boolean,
   now = Date.now(),
+  prices: readonly ModelPricing[] = [],
 ): UsageEvent {
-  const model = usage.model ?? adapter.modelFromPath?.(info.pathname) ?? null;
+  const model = resolveModel(adapter, info, usage);
   const inputTokens = usage.inputTokens ?? 0;
   const outputTokens = usage.outputTokens ?? 0;
   let estimatedCostUsd = 0;
   let usageSource: UsageSource = 'unknown';
-  if (usage.inputTokens !== undefined && usage.outputTokens !== undefined && model !== null) {
+  if (model !== null && isPriceable(adapter, info, usage)) {
     try {
-      estimatedCostUsd = adapter.calculateCost({ model, inputTokens, outputTokens });
+      const price = findPricing(prices, adapter.id, model);
+      estimatedCostUsd = price
+        ? calculateCostUsd({ inputTokens, outputTokens }, price)
+        : adapter.calculateCost({ model, inputTokens, outputTokens });
       usageSource = 'provider_reported';
     } catch {
       // No price for this model: cost stays 0 and the source stays 'unknown'.
@@ -183,7 +205,8 @@ export async function trackUsage(
         : await readUsageFromJson(stream, adapter)
       : { usage: {}, incomplete: false };
 
-    const event = buildUsageEvent(adapter, ctx, info, usage, streaming);
+    const prices = isPriceable(adapter, info, usage) ? await loadPrices(ctx) : [];
+    const event = buildUsageEvent(adapter, ctx, info, usage, streaming, Date.now(), prices);
     telemetry.increment('token_usage', { provider: adapter.id, usage_source: event.usageSource }, event.totalTokens);
     telemetry.increment('estimated_spend', { provider: adapter.id }, event.estimatedCostUsd);
     if (incomplete) {
@@ -195,5 +218,20 @@ export async function trackUsage(
     console.error(
       JSON.stringify({ type: 'usage_branch_error', request_id: ctx.requestId, name: (error as Error)?.name }),
     );
+  }
+}
+
+/**
+ * A price-table failure is treated as "unpriced" (cost 0, usage_source 'unknown')
+ * rather than delaying the usage event: losing the event would lose its token
+ * counts too, and the request log still shows the model is missing a cost.
+ */
+async function loadPrices(ctx: UsageContext): Promise<readonly ModelPricing[]> {
+  if (!ctx.loadPrices) return [];
+  try {
+    return await ctx.loadPrices();
+  } catch (error) {
+    console.error(JSON.stringify({ type: 'price_lookup_failed', request_id: ctx.requestId, name: (error as Error)?.name }));
+    return [];
   }
 }

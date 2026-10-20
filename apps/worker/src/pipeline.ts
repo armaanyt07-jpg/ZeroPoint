@@ -1,4 +1,4 @@
-import { assertUserAllowed, authenticate } from './auth';
+import { assertUserAllowed, authenticate, recordKeyUse } from './auth';
 import { assertWithinBudget, getCurrentSpend, resolveBudgetLimit } from './budget';
 import { checkPatternHash, hashRequest, readCircuitState } from './circuit-breaker';
 import { decryptProviderCredential } from './credentials';
@@ -36,6 +36,7 @@ export async function handleProxyRequest(
   try {
     // 1. FR-1.1: who is calling? (401)
     const auth = await authenticate(request, deps.directory);
+    deps.defer(recordKeyUse(deps.redis, deps.apiKeyStore, telemetry, auth.apiKeyId));
 
     // 2. FR-1.4: which provider? Explicit x-provider header (400 if missing/unsupported).
     const providerId = request.headers.get('x-provider')?.trim().toLowerCase();
@@ -116,6 +117,7 @@ export async function handleProxyRequest(
       startedAt,
       queue: deps.usageQueue,
       defer: deps.defer,
+      loadPrices: () => deps.directory.getModelPrices(),
     });
     telemetry.increment('requests_allowed', { provider: adapter.id });
     return response;

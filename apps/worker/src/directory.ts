@@ -1,4 +1,10 @@
-import type { ProviderId } from '@zeropoint/types';
+import {
+  PRICING_CACHE_KEY,
+  apiKeyCacheKey,
+  endUserCacheKey,
+  providerCredentialCacheKey,
+} from '@zeropoint/schemas';
+import type { ModelPricing, ProviderId } from '@zeropoint/types';
 import type { RedisClient } from './redis';
 import type { ApiKeyRecord, EndUserRecord, TenantStore } from './store';
 import type { Telemetry } from './telemetry';
@@ -35,20 +41,25 @@ export class Directory {
   ) {}
 
   getApiKey(keyHash: string): Promise<ApiKeyRecord | null> {
-    return this.readThrough(`cache:apikey:${keyHash}`, () => this.store.findApiKeyByHash(keyHash));
+    return this.readThrough(apiKeyCacheKey(keyHash), () => this.store.findApiKeyByHash(keyHash));
   }
 
   getEndUser(tenantId: string, externalUserId: string): Promise<EndUserRecord | null> {
-    return this.readThrough(`cache:enduser:${tenantId}:${externalUserId}`, () =>
+    return this.readThrough(endUserCacheKey(tenantId, externalUserId), () =>
       this.store.findEndUser(tenantId, externalUserId),
     );
   }
 
   /** Cached value is ciphertext only; plaintext provider keys are never put in Redis. */
   getEncryptedCredential(tenantId: string, provider: ProviderId): Promise<string | null> {
-    return this.readThrough(`cache:providercred:${tenantId}:${provider}`, () =>
+    return this.readThrough(providerCredentialCacheKey(tenantId, provider), () =>
       this.store.findProviderCredential(tenantId, provider),
     );
+  }
+
+  /** The whole price table, one cache entry (it is small and changes rarely). */
+  async getModelPrices(): Promise<ModelPricing[]> {
+    return (await this.readThrough(PRICING_CACHE_KEY, () => this.store.findModelPrices())) ?? [];
   }
 
   private async readThrough<T>(key: string, load: () => Promise<T | null>): Promise<T | null> {

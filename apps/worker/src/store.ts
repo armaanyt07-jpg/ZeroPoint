@@ -2,6 +2,7 @@ import type {
   ApiKeyStatus,
   CircuitBreakerEvent,
   EndUserStatus,
+  ModelPricing,
   ProviderId,
   TenantPolicy,
   UsageEvent,
@@ -36,6 +37,14 @@ export interface TenantStore {
    * tenant row is a foreign key of `end_users`/`api_keys`, so it must already exist.
    */
   findTenantPolicy(tenantId: string): Promise<TenantPolicy | null>;
+  /** The administrator-entered price table (`model_prices`, Phase 4 D9). Small and global. */
+  findModelPrices(): Promise<ModelPricing[]>;
+}
+
+/** FR-4.1 bookkeeping: when a proxy key was last used (Phase 4, D11). */
+export interface ApiKeyUsageStore {
+  /** Best-effort, throttled by the caller; never on the request's critical path. */
+  touchApiKey(apiKeyId: string, usedAt: string): Promise<void>;
 }
 
 /** The one database write the Worker performs (FR-2.3): durable, idempotent settlement. */
@@ -102,7 +111,7 @@ function parseTenantPolicy(row: Row): TenantPolicy {
  * which works from a Worker without a database driver. The service-role key
  * bypasses Row Level Security, so it must stay a Worker secret (see migration 003).
  */
-export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerStore {
+export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerStore, ApiKeyUsageStore {
   constructor(
     private readonly baseUrl: string,
     private readonly serviceRoleKey: string,
@@ -136,6 +145,39 @@ export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerSto
       id: `eq.${tenantId}`,
     });
     return row ? parseTenantPolicy(row) : null;
+  }
+
+  async findModelPrices(): Promise<ModelPricing[]> {
+    const rows = await this.selectAll('model_prices', {
+      select: 'provider,model,input_per_million_usd,output_per_million_usd',
+    });
+    return rows.map((row) => ({
+      provider: str(row, 'provider'),
+      model: str(row, 'model'),
+      inputPerMillionTokens: num(row, 'input_per_million_usd'),
+      outputPerMillionTokens: num(row, 'output_per_million_usd'),
+    }));
+  }
+
+  async touchApiKey(apiKeyId: string, usedAt: string): Promise<void> {
+    const params = new URLSearchParams({ id: `eq.${apiKeyId}` });
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/rest/v1/api_keys?${params}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: this.serviceRoleKey,
+          authorization: `Bearer ${this.serviceRoleKey}`,
+          'content-type': 'application/json',
+          prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ last_used_at: usedAt }),
+        signal: AbortSignal.timeout(this.writeTimeoutMs),
+      });
+    } catch {
+      throw new StoreError('Database request failed or timed out.');
+    }
+    if (!response.ok) throw new StoreError(`Database returned HTTP ${response.status}.`);
   }
 
   /** Best-effort insert (CircuitBreakerStore); the caller decides how to handle a failure. */
@@ -232,8 +274,13 @@ export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerSto
   }
 
   private async selectOne(table: string, query: Record<string, string>): Promise<Row | null> {
+    const rows = await this.selectAll(table, { ...query, limit: '1' });
+    return rows[0] ?? null;
+  }
+
+  private async selectAll(table: string, query: Record<string, string>): Promise<Row[]> {
     // URLSearchParams percent-encodes values, so user input can't inject extra filters.
-    const params = new URLSearchParams({ ...query, limit: '1' });
+    const params = new URLSearchParams(query);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/rest/v1/${table}?${params}`, {
@@ -249,10 +296,7 @@ export class SupabaseStore implements TenantStore, UsageStore, CircuitBreakerSto
     }
     if (!response.ok) throw new StoreError(`Database returned HTTP ${response.status}.`);
     const rows = (await response.json()) as unknown;
-    if (!Array.isArray(rows)) throw new StoreError('Unexpected database response.');
-    const first: unknown = rows[0];
-    if (first === undefined) return null;
-    if (!isObject(first)) throw new StoreError('Unexpected database response.');
-    return first;
+    if (!Array.isArray(rows) || !rows.every(isObject)) throw new StoreError('Unexpected database response.');
+    return rows;
   }
 }

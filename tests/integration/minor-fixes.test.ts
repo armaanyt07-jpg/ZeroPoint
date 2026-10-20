@@ -67,7 +67,7 @@ describe('Minor 1: /health', () => {
     const h = await createHarness();
     await send(h, health());
     expect(h.redis.getCalls).toHaveLength(0);
-    expect(h.store.calls).toEqual({ apiKey: 0, endUser: 0, credential: 0, policy: 0 });
+    expect(h.store.calls).toEqual({ apiKey: 0, endUser: 0, credential: 0, policy: 0, prices: 0 });
     expect(h.telemetry.accounting()).toEqual({ total: 0, allowed: 0, rejected: 0 });
   });
 });

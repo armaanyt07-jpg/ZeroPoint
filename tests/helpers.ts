@@ -1,6 +1,6 @@
 import { encryptSecret, generateEncryptionKey, sha256Hex } from '@zeropoint/crypto';
 import { createDefaultRegistry } from '@zeropoint/providers';
-import type { CircuitBreakerEvent, TenantPolicy, UsageEvent, WebhookEvent } from '@zeropoint/types';
+import type { CircuitBreakerEvent, ModelPricing, TenantPolicy, UsageEvent, WebhookEvent } from '@zeropoint/types';
 import { vi } from 'vitest';
 import { runLuaScript } from './lua-redis';
 import { Directory } from '../apps/worker/src/directory';
@@ -10,6 +10,7 @@ import { RedisError } from '../apps/worker/src/redis';
 import {
   StoreError,
   type ApiKeyRecord,
+  type ApiKeyUsageStore,
   type CircuitBreakerStore,
   type EndUserRecord,
   type TenantStore,
@@ -73,16 +74,21 @@ export class FakeRedis implements RedisClient {
   }
 }
 
-export class FakeStore implements TenantStore, CircuitBreakerStore {
+export class FakeStore implements TenantStore, CircuitBreakerStore, ApiKeyUsageStore {
   apiKeys = new Map<string, ApiKeyRecord>();
   endUsers = new Map<string, EndUserRecord>();
   credentials = new Map<string, string>();
   policies = new Map<string, TenantPolicy>();
+  prices: ModelPricing[] = [];
   circuitBreakerEvents: CircuitBreakerEvent[] = [];
+  /** `api_keys.last_used_at` writes, in order. */
+  keyTouches: { apiKeyId: string; usedAt: string }[] = [];
   failing = false;
   /** Fail only the credential table, to test error precedence. */
   failCredentials = false;
-  calls = { apiKey: 0, endUser: 0, credential: 0, policy: 0 };
+  /** Fail only the price table (Phase 4). */
+  failPrices = false;
+  calls = { apiKey: 0, endUser: 0, credential: 0, policy: 0, prices: 0 };
 
   private check() {
     if (this.failing) throw new StoreError('db down');
@@ -111,6 +117,16 @@ export class FakeStore implements TenantStore, CircuitBreakerStore {
   async recordCircuitBreakerEvent(event: CircuitBreakerEvent) {
     this.check();
     this.circuitBreakerEvents.push(event);
+  }
+  async findModelPrices() {
+    this.calls.prices++;
+    this.check();
+    if (this.failPrices) throw new StoreError('prices table down');
+    return [...this.prices];
+  }
+  async touchApiKey(apiKeyId: string, usedAt: string) {
+    this.check();
+    this.keyTouches.push({ apiKeyId, usedAt });
   }
 }
 
@@ -254,6 +270,7 @@ export async function createHarness(): Promise<Harness> {
     usageQueue: queue,
     webhookQueue,
     circuitBreakerStore: store,
+    apiKeyStore: store,
     defer,
   };
   const flush = async () => {

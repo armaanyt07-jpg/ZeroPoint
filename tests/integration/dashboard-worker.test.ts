@@ -66,15 +66,58 @@ describe('dashboard-managed prices (Phase 4, D9)', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     await send(h);
     expect(h.queue.sent[0]).toMatchObject({ inputTokens: 1000, outputTokens: 500, estimatedCostUsd: 0, usageSource: 'unknown' });
+    expect(h.store.calls.prices).toBe(2); // the early read and one retry, no more
   });
 
-  it('does not read prices for a response with no usage to price', async () => {
+  it('retries a failed price read once, so a transient failure still prices the request (D18)', async () => {
+    const h = await createHarness();
+    h.store.prices = [DB_PRICE];
+    h.store.pricesFailures = 1;
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await send(h);
+    expect(h.queue.sent[0]).toMatchObject({ usageSource: 'provider_reported', estimatedCostUsd: 0.002 });
+    expect(h.store.calls.prices).toBe(2);
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(errors.mock.calls[0]?.[0]))).toMatchObject({ type: 'price_lookup_failed', attempt: 1 });
+  });
+
+  it('reads prices while the provider is still answering, so a slow answer cannot break pricing (D18)', async () => {
+    const h = await createHarness();
+    h.store.prices = [DB_PRICE];
+    let answer!: (response: Response) => void;
+    h.providerFetch.mockImplementationOnce(() => new Promise<Response>((resolve) => (answer = resolve)));
+    const pending = handleProxyRequest(proxyRequest(), h.deps);
+
+    // The price table is read before the provider has answered...
+    await vi.waitFor(() => expect(h.store.calls.prices).toBe(1));
+    // ...so it no longer matters if Redis and the database stop answering during a long wait.
+    h.store.failPrices = true;
+    h.redis.failing = true;
+    answer(jsonAnswer());
+
+    const res = await pending;
+    expect(res.status).toBe(200);
+    await res.text();
+    await h.flush();
+    expect(h.queue.sent[0]).toMatchObject({ usageSource: 'provider_reported', estimatedCostUsd: 0.002 });
+  });
+
+  it('a response with no usage to price uses only the early read, never a retry', async () => {
     const h = await createHarness();
     const res = await handleProxyRequest(proxyRequest(), h.deps); // harness default answer has no usage
     await res.text();
     await h.flush();
     expect(h.queue.sent[0]?.usageSource).toBe('unknown');
+    expect(h.store.calls.prices).toBe(1);
+  });
+
+  it('a rejected request never reads prices', async () => {
+    const h = await createHarness();
+    const res = await handleProxyRequest(proxyRequest({ headers: { authorization: 'Bearer pk_live_wrong' } }), h.deps);
+    expect(res.status).toBe(401);
+    await h.flush();
     expect(h.store.calls.prices).toBe(0);
+    expect(h.redis.getCalls).not.toContain(PRICING_CACHE_KEY);
   });
 });
 

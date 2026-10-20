@@ -7,6 +7,7 @@ import { StoreError } from './store';
 import { ZeroPointError, errorResponse, toErrorResponse } from './errors';
 import { forwardToProvider } from './proxy';
 import { recordAndNotify } from './settlement';
+import { prefetchPrices } from './streaming/usage-extractor';
 import type { Telemetry } from './telemetry';
 
 /**
@@ -104,6 +105,9 @@ export async function handleProxyRequest(
     }
 
     // 8. FR-1.3: swap in the tenant's provider credential and forward.
+    //    The price table is read now, while the provider answers, not after (D18).
+    //    It is not awaited here, so it adds no latency.
+    const loadPrices = prefetchPrices(() => deps.directory.getModelPrices());
     const providerKey = await decryptProviderCredential(
       await credentialLookup,
       deps.encryptionKey,
@@ -117,7 +121,7 @@ export async function handleProxyRequest(
       startedAt,
       queue: deps.usageQueue,
       defer: deps.defer,
-      loadPrices: () => deps.directory.getModelPrices(),
+      loadPrices,
     });
     telemetry.increment('requests_allowed', { provider: adapter.id });
     return response;

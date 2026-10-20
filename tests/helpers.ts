@@ -88,6 +88,8 @@ export class FakeStore implements TenantStore, CircuitBreakerStore, ApiKeyUsageS
   failCredentials = false;
   /** Fail only the price table (Phase 4). */
   failPrices = false;
+  /** Number of upcoming price-table reads that fail (a transient outage). */
+  pricesFailures = 0;
   calls = { apiKey: 0, endUser: 0, credential: 0, policy: 0, prices: 0 };
 
   private check() {
@@ -122,6 +124,10 @@ export class FakeStore implements TenantStore, CircuitBreakerStore, ApiKeyUsageS
     this.calls.prices++;
     this.check();
     if (this.failPrices) throw new StoreError('prices table down');
+    if (this.pricesFailures > 0) {
+      this.pricesFailures--;
+      throw new StoreError('prices read timed out');
+    }
     return [...this.prices];
   }
   async touchApiKey(apiKeyId: string, usedAt: string) {

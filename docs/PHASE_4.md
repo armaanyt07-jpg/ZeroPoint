@@ -77,6 +77,7 @@ Decided during implementation:
 15. **D15: Action feedback fires when the action settles, not from an effect.** The action's response re-renders the page, and that often removes the form that submitted it: a revoked key loses its Revoke button, a deleted price loses its row. An effect in an unmounted form never runs, so revoking showed no confirmation at all. Caught by the end-to-end run.
 16. **D16: Webhook URLs must be `https://` with no embedded credentials.** The payload names blocked users. Payloads are still unsigned; that is a Phase 3 known limitation.
 17. **D17: The magic link is only sent to allowlisted addresses, and the reply is identical either way.** Strangers cannot create Supabase accounts, and the form doesn't reveal who is an admin. The callback only ever redirects to `/`, so it can't be used as an open redirect.
+18. **D18: The price table is read while the provider answers, and a failed read is retried once.** Found in the first live test: Gemini took about 40 seconds, and the lookup made afterwards timed out on both Redis and the database, so the request was recorded at cost 0 and never counted against the user's budget. `prefetchPrices()` starts the read just before forwarding (not awaited, so no added latency; usually one Redis GET) and the usage branch uses that result, or reads once more if it failed. Rejected requests never read prices. This replaces D9's "not retried". If both reads fail, the request is still recorded as unpriced.
 
 ## Implementation Status
 Deferred:
@@ -91,14 +92,14 @@ Deferred:
 - Per-tenant prices.
 
 ## Tests
-`pnpm test`: 448 tests in 27 files (385 from Phases 1-3, unchanged in behaviour; 63 new or extended). New or extended files:
+`pnpm test`: 451 tests in 27 files (385 from Phases 1-3, unchanged in behaviour; 66 new or extended). New or extended files:
 
 | File | Covers |
 | --- | --- |
 | `tests/unit/migrations.test.ts` (extended) | Migration 007 on PGlite: `admins` lowercase/email CHECK, `model_prices` uniqueness and non-negative CHECKs, RLS on both tables. The four aggregate functions against seeded logs: tenant isolation, range boundary, zero-filled UTC days, open-circuit counting (expired trips and repeat trips excluded), top-spender ordering and limit, unpriced models. None of the functions is executable by PUBLIC |
 | `tests/unit/pricing.test.ts` (extended) | `stripModelVersion` (dated, compact-dated, `-NNN`, `-latest`); `findPricing` prefers exact matches, prices snapshots with the family price, and never falls back from `gpt-4o-mini` to `gpt-4o` or across providers; the dashboard's provider list equals the Worker registry's |
 | `tests/unit/crypto.test.ts` (extended) | `generateProxyKey`: format, digest, prefix, uniqueness |
-| `tests/integration/dashboard-worker.test.ts` | Worker: DB price used for a dated snapshot, DB price beats the static table, static fallback, price table cached (one DB read for three requests), price-read failure records the request as unpriced instead of losing it, no price read when there is nothing to price. `last_used_at`: one write per key per window, again after the window, never for an unauthenticated request, skipped (not per-request) when Redis is down, never throws |
+| `tests/integration/dashboard-worker.test.ts` | Worker: DB price used for a dated snapshot, DB price beats the static table, static fallback, price table cached (one DB read for three requests), prices read before the provider answers (a slow answer followed by a Redis and database outage is still priced, D18), a failed read retried once, two failed reads record the request as unpriced instead of losing it, no retry when there is nothing to price, no price read for a rejected request. `last_used_at`: one write per key per window, again after the window, never for an unauthenticated request, skipped (not per-request) when Redis is down, never throws |
 | `apps/dashboard/tests/validation.test.ts` | Every form schema: NUMERIC(12,4)/(12,6) bounds and decimals, exponent/sign/hex inputs rejected, zero velocity limit rejected, https-only webhooks (no `http:`, `javascript:` or `user:pw@`), UUID ids (no PostgREST filter injection), provider allow-list, `x-user-id` rules shared with the Worker, empty budget -> NULL (tenant default), analytics range |
 | `apps/dashboard/tests/auth-and-actions.test.ts` | `decideAdmin` (all four outcomes, case-insensitive, unconfirmed email never trusted even when allowlisted). `buildAdminAction`: admin checked before validation; field errors without running the handler; the audit line names the admin and never the inputs; only `UserFacingError` messages reach the UI; redirects pass through |
 | `apps/dashboard/tests/cache-and-format.test.ts` | `deleteCacheKeys` sends one `DEL` with every key and never throws (unconfigured, network, HTTP 500, Redis error). USD formatting keeps tiny costs visible. Axis ticks stay distinct below $1. LIKE escaping. The range start is UTC midnight |
@@ -123,7 +124,9 @@ Deferred:
   - The Worker's `SupabaseStore.findModelPrices` and `touchApiKey` were also run against that PostgREST.
 - Two dashboard bugs were found by this run and fixed (D14, D15), along with an axis-label bug: every tick printed "$0".
 
-**Not tested**: real Supabase Auth email delivery and its redirect allow-list; a real Vercel deployment; a real Upstash instance; the Worker and dashboard against the same live Redis at once.
+**Live run (2026-10-20)**: the Worker (`pnpm dev`) and the dashboard against a real Supabase project, a real Upstash database and Google Gemini. Magic-link sign-in, tenant, credential, price and key setup, and a proxied Gemini request whose usage and cost reached the Overview page all worked. It found the price-lookup timeout fixed by D18.
+
+**Not tested**: a real Vercel deployment; a deployed Worker on Cloudflare (queues, edge network).
 
 ## Known Limitations
 - **The dashboard server holds the system's most powerful secrets**: the service-role key, the credential encryption key and the Redis token. One action that skipped the admin check would expose all of them. This is mitigated by the single `adminAction` wrapper, the test that enforces it, and `getAdminDb()` for reads.

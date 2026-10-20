@@ -3,6 +3,7 @@
  * Critical 4 is covered in tests/unit/clients.test.ts.
  */
 import { encryptSecret, generateEncryptionKey, sha256Hex } from '@zeropoint/crypto';
+import { PRICING_CACHE_KEY } from '@zeropoint/schemas';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import worker from '../../apps/worker/src/index';
 import { route } from '../../apps/worker/src/router';
@@ -168,8 +169,11 @@ describe('Major 2: pre-flight latency structure (NFR-5.1)', () => {
     await h.flush();
     h.redis.getCalls = [];
     await send(h, proxyRequest());
-    expect(h.redis.getCalls).toHaveLength(5); // apikey, enduser, spend, circuit state, credential
+    // apikey, enduser, spend, circuit state, credential; then the price table, which is
+    // started just before forwarding and not awaited (Phase 4 D18), so it is not a stage.
+    expect(h.redis.getCalls).toHaveLength(6);
     expect(h.redis.getCalls[0]).toMatch(/^cache:apikey:/);
+    expect(h.redis.getCalls[5]).toBe(PRICING_CACHE_KEY);
   });
 
   describe('policy decisions take precedence over a failing credential lookup', () => {

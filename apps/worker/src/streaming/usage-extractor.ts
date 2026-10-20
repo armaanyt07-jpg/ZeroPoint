@@ -25,8 +25,11 @@ export interface UsageContext {
   /** Overrides queue retry timing (tests). */
   queueRetry?: Partial<RetryOptions>;
   /**
-   * The administrator-entered price table (Phase 4, D9), loaded only when a
-   * request actually has usage to price. Absent = only the adapter's static table.
+   * The administrator-entered price table (Phase 4, D9). Awaited only when a
+   * request actually has usage to price, and called again once if that fails.
+   * The pipeline passes a `prefetchPrices` loader, so the first call usually
+   * returns a read started before the provider was called (D18).
+   * Absent = only the adapter's static table.
    */
   loadPrices?: () => Promise<readonly ModelPricing[]>;
 }
@@ -221,17 +224,53 @@ export async function trackUsage(
   }
 }
 
+/** The first price-table read plus one retry (D18). */
+export const PRICE_LOAD_ATTEMPTS = 2;
+
 /**
- * A price-table failure is treated as "unpriced" (cost 0, usage_source 'unknown')
- * rather than delaying the usage event: losing the event would lose its token
- * counts too, and the request log still shows the model is missing a cost.
+ * Starts `load` right away and returns a loader: its first call gets that early
+ * result, any later call (a retry) loads again.
+ *
+ * Why (D18): an LLM answer can take a minute. A price lookup made only after
+ * that wait was seen to time out in practice, and a request that can't be priced
+ * is recorded at cost 0, so it never counts against the user's budget. Starting
+ * the read while the provider is still answering avoids the wait. The read is
+ * usually one Redis GET (`cache:pricing`) and is not awaited before forwarding,
+ * so it adds no latency.
+ */
+export function prefetchPrices(
+  load: () => Promise<readonly ModelPricing[]>,
+): () => Promise<readonly ModelPricing[]> {
+  let early: Promise<readonly ModelPricing[]> | undefined = load();
+  early.catch(() => {}); // the first caller sees the error; avoid an unhandled rejection until then
+  return () => {
+    const result = early ?? load();
+    early = undefined;
+    return result;
+  };
+}
+
+/**
+ * A failed read is retried once. If both attempts fail, the request is recorded
+ * as "unpriced" (cost 0, usage_source 'unknown') rather than dropped: losing the
+ * event would lose its token counts too, and the request log still shows the
+ * model is missing a cost.
  */
 async function loadPrices(ctx: UsageContext): Promise<readonly ModelPricing[]> {
   if (!ctx.loadPrices) return [];
-  try {
-    return await ctx.loadPrices();
-  } catch (error) {
-    console.error(JSON.stringify({ type: 'price_lookup_failed', request_id: ctx.requestId, name: (error as Error)?.name }));
-    return [];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await ctx.loadPrices();
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'price_lookup_failed',
+          request_id: ctx.requestId,
+          attempt,
+          name: (error as Error)?.name,
+        }),
+      );
+      if (attempt >= PRICE_LOAD_ATTEMPTS) return [];
+    }
   }
 }

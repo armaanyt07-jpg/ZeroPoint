@@ -323,3 +323,15 @@ See the Tests section of `docs/PHASE_4.md`. The end-to-end run found two real bu
 `tests/**`, `apps/dashboard/tests/**`, `docs/PHASE_4.md`, `docs/CHANGELOG.md`, `README.md`, `database/README.md`.
 ### How To Verify
 `pnpm check`, `pnpm build:check` and `pnpm dashboard:build`.
+
+## Step 19 - Price lookup during the provider call (D18)
+### What Changed
+The Worker now starts reading the price table just before it forwards a request, instead of after the provider answers, and retries a failed read once. 3 new tests (451 total). ESLint also skips wrangler's build output in `apps/worker/.wrangler`.
+### Why
+Found during the first live test (Supabase + Upstash + Gemini). Gemini took about 40 seconds to answer. The price lookup that ran afterwards timed out on both Redis (1 s) and the database (2 s), so the request was recorded at cost 0 with `usage_source='unknown'`. A request recorded at cost 0 never counts against the user's budget, and slow LLM answers are normal.
+### How It Works
+`prefetchPrices()` (`streaming/usage-extractor.ts`) starts the read and returns a loader. The first call gets that early read; a retry starts a new one. The pipeline does not await it before forwarding, so it adds no latency. It is usually one Redis GET of `cache:pricing`. Rejected requests (401/403/429) never read prices. If both attempts fail, the request is still recorded as unpriced, as before.
+### Files Changed
+`apps/worker/src/pipeline.ts`, `apps/worker/src/streaming/usage-extractor.ts`, `tests/helpers.ts`, `tests/integration/dashboard-worker.test.ts`, `tests/integration/review-fixes.test.ts`, `eslint.config.js`, `docs/PHASE_4.md`, `docs/CHANGELOG.md`.
+### How To Verify
+`pnpm check`. Live: send a Gemini request through `pnpm dev`; the Overview page shows a non-zero spend for it.

@@ -164,3 +164,7 @@ Every change and the reason for it is in [CHANGELOG.md](docs/CHANGELOG.md).
 - rebuilding Redis spend from Postgres
 - multi-level budgets (per key, model and feature)
 - a persisted log of operational failures
+
+## License
+
+[MIT](LICENSE) © 2026 Armaan Ali

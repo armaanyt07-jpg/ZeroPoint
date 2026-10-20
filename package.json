@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "ZeroPoint - Edge AI Gateway & Cost Governance Proxy (Phase 4)",
+  "license": "MIT",
   "packageManager": "pnpm@12.6.0",
   "engines": {
     "node": ">=20"
